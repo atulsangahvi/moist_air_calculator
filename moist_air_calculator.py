@@ -1,22 +1,50 @@
 # Moist Air Calculator — HVAC Volumetric Flow (m³/s) + Dual Enthalpy + Unicode-Safe PDF
-# - Inputs: DB + (RH or WB), Pressure, Volumetric flow V̇_in (m³/s), External heat rate Q̇ (kW)
-# - Outputs: Psychrometrics, transport props, enthalpy (per kg_dry & per kg_moist),
-#            enthalpy flow at each state (kW), process capacity (kW), condensate if any,
-#            implied outlet volumetric flow.
-# - PDF: Upload a Unicode TTF (e.g., DejaVuSans.ttf). If not provided, text is sanitized to ASCII to avoid Unicode errors.
+# - No SciPy required (pure-Python bisection for root-finding)
+# - Pin Python 3.11 (via runtime.txt) so CoolProp/Numpy wheels are available
 
 import sys, platform, tempfile
 from io import BytesIO
 import streamlit as st
 import numpy as np
-from scipy.optimize import root_scalar
 from CoolProp.CoolProp import HAPropsSI
 from fpdf import FPDF
 
 st.set_page_config(page_title="Moist Air Calculator (HVAC volumetric + PDF)", layout="wide")
 ATM_P = 101325.0
 
-# -------------------- helpers: numeric text inputs --------------------
+# -------------------- tiny, robust bisection solver (no SciPy) --------------------
+def bisect_solve(func, a, b, *, max_iter=80, tol=1e-7):
+    """Find root of continuous func in [a,b] assuming f(a)*f(b) <= 0. Returns mid if fails."""
+    fa = func(a); fb = func(b)
+    if not np.isfinite(fa) or not np.isfinite(fb):
+        return 0.5*(a+b)
+    if fa == 0.0: return a
+    if fb == 0.0: return b
+    if fa*fb > 0:
+        # Try to expand the bracket a little if possible
+        for k in range(6):
+            da = (b-a)*0.1*(k+1)
+            fa = func(a - da); fb = func(b + da)
+            if np.isfinite(fa) and np.isfinite(fb) and fa*fb <= 0:
+                a, b = a - da, b + da
+                break
+        else:
+            return 0.5*(a+b)
+    for _ in range(max_iter):
+        c = 0.5*(a+b)
+        fc = func(c)
+        if not np.isfinite(fc):  # numerical hiccup: nudge c
+            c = np.nextafter(c, b)
+            fc = func(c)
+        if abs(fc) < tol or 0.5*(b-a) < tol:
+            return c
+        if fa*fc <= 0:
+            b, fb = c, fc
+        else:
+            a, fa = c, fc
+    return 0.5*(a+b)
+
+# -------------------- numeric input helpers --------------------
 def parse_number(text, *, min_val=None, max_val=None, field_name="value"):
     if text is None: raise ValueError(f"{field_name}: empty.")
     s = text.strip().replace(",", ".")
@@ -73,7 +101,7 @@ def humid_air_props(T_K, P_Pa=ATM_P, RH=None, W=None):
 
     # μ, k, cp
     try:
-        mu  = HAPropsSI('M','T',T_K,'P',P_Pa,'W',W)  # dynamic viscosity
+        mu  = HAPropsSI('M','T',T_K,'P',P_Pa,'W',W)
     except Exception:
         mu = 1.716e-5 * (T_K/273.15)**1.5 * (273.15+111.0)/(T_K+111.0)
     try:
@@ -118,15 +146,15 @@ def state_from_DB_RH(Tdb_C, RH_pct, P=ATM_P):
 def state_from_DB_WB(Tdb_C, Twb_C, P=ATM_P):
     T = Tdb_C + 273.15
     Twb = min(Twb_C, Tdb_C) + 273.15
-    def f(W): return HAPropsSI('Twb','T',T,'P',P,'W',W) - Twb
+    # invert Twb(T,W) = target  ->  find W
+    def fW(W): return HAPropsSI('Twb','T',T,'P',P,'W',W) - Twb
     W_lo = 1e-7
     try:
         W_hi = HAPropsSI('W','T',T,'P',P,'R',0.999)
     except Exception:
         W_hi = 0.03
     try:
-        sol = root_scalar(f, bracket=[W_lo, W_hi], method='bisect', xtol=1e-7)
-        W = sol.root
+        W = bisect_solve(fW, W_lo, W_hi, tol=1e-8)
     except Exception:
         W = HAPropsSI('W','T',T,'P',P,'R',0.5)
     s = humid_air_props(T, P, W=W); s['T'] = T; return s
@@ -141,12 +169,11 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P=ATM_P):
     q_per_kg_dry = (Qdot_kW*1000.0) / m_dot_dry  # J per kg_dry
     h2_target = h1 + q_per_kg_dry
 
-    # Dry (constant-W) attempt
-    def h_at_T_constW(T): return HAPropsSI('H','T',T,'P',P,'W',W1)
+    # Dry (constant-W) attempt: solve H(T,W1) == h2_target
+    def H_constW(T): return HAPropsSI('H','T',T,'P',P,'W',W1) - h2_target
     T_lo = max(173.15, T1 - 100.0); T_hi = min(373.15, T1 + 100.0)
     try:
-        T2_dry = root_scalar(lambda T: h_at_T_constW(T) - h2_target,
-                             bracket=[T_lo, T_hi], method='bisect').root
+        T2_dry = bisect_solve(H_constW, T_lo, T_hi)
         RH2 = HAPropsSI('R','T',T2_dry,'P',P,'W',W1)
         if RH2 <= 0.999 or q_per_kg_dry >= 0:
             s2 = humid_air_props(T2_dry, P, W=W1); s2['T'] = T2_dry
@@ -154,27 +181,26 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P=ATM_P):
     except Exception:
         pass
 
-    # Saturated (condensation) solution
-    def h_sat(T):
+    # Saturated (condensation) solution: H(T, Wsat(T)) == target
+    def H_sat(T):
         Wsat = HAPropsSI('W','T',T,'P',P,'R',0.999)
-        return HAPropsSI('H','T',T,'P',P,'W',Wsat)
+        return HAPropsSI('H','T',T,'P',P,'W',Wsat) - h2_target
     try:
-        T2 = root_scalar(lambda T: h_sat(T) - h2_target,
-                         bracket=[max(173.15, T1-80.0), T1], method='bisect').root
+        T2 = bisect_solve(H_sat, max(173.15, T1-80.0), T1)
         W2 = HAPropsSI('W','T',T2,'P',P,'R',0.999)
         s2 = humid_air_props(T2, P, W=W2); s2['T'] = T2
-
         dW = max(0.0, W1 - W2)                 # kg_vapor/kg_dry removed
         mdot_cond_kg_s = dW * m_dot_dry        # kg/s
         condensate = {
             'dW_g_per_kg': 1000.0*dW,
             'mdot_g_s': 1000.0*mdot_cond_kg_s,
             'mdot_kg_h': 3600.0*mdot_cond_kg_s,
-            'vol_mL_s': 1000.0*mdot_cond_kg_s,  # ≈ 1 g/mL
+            'vol_mL_s': 1000.0*mdot_cond_kg_s,
             'vol_L_h': 3.6*mdot_cond_kg_s
         }
         return s2, "Cooling with condensation (final state saturated).", condensate
     except Exception as e:
+        # Last resort: constant-W sensible estimate
         cp1 = s1['cp']
         T2_guess = np.clip(T1 + (h2_target - h1)/max(cp1,1e-9), T_lo, T_hi)
         s2 = humid_air_props(T2_guess, P, W=W1); s2['T'] = T2_guess
@@ -182,7 +208,7 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P=ATM_P):
 
 # -------------------- display helpers --------------------
 def enthalpy_dual(s):
-    """Return tuple: (h_dry_kJkgda, h_moist_kJkg)"""
+    """Return (h_dry_kJkgda, h_moist_kJkg)."""
     h_dry_kJkgda = s['h']/1000.0
     h_moist_kJkg = h_dry_kJkgda / (1.0 + s['W'])
     return h_dry_kJkgda, h_moist_kJkg
@@ -278,8 +304,6 @@ def build_pdf(data, font_path: str | None = None):
     pdf.add_page()
 
     latin1_mode = font_path is None
-
-    # Font setup
     if not latin1_mode:
         try:
             pdf.add_font("UNI", "", font_path, uni=True)
@@ -289,12 +313,10 @@ def build_pdf(data, font_path: str | None = None):
     if latin1_mode:
         pdf.set_font("Arial", "B", 16)
 
-    # Title
     title = data.get("title", "Moist Air Report")
     if latin1_mode: title = _latin1_sanitize(title)
     pdf.cell(0, 10, title, 0, 1, "C")
 
-    # Optional logo
     if data.get("logo_bytes"):
         try:
             tmp_logo = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
@@ -319,7 +341,6 @@ def build_pdf(data, font_path: str | None = None):
             pdf.cell(85, 6, f"{k}:", 0, 0)
             pdf.cell(0, 6, f"{v}", 0, 1)
 
-    # Sections in chosen order
     for sec in data.get("sections", []):
         if sec == "Inputs":
             section_header("Inputs"); kv_table(data.get("inputs", {}))
@@ -342,7 +363,6 @@ def build_pdf(data, font_path: str | None = None):
                 for line in txt.splitlines():
                     pdf.multi_cell(0, 6, line)
 
-    # Return bytes (handle fpdf2 variations)
     out = pdf.output(dest="S")
     return out if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
 
@@ -511,29 +531,53 @@ if condensate is not None:
         "V̇_cond (L/h)": f"{condensate['vol_L_h']:.3f}",
     }
 
-# Prepare optional font path (saved to a temp file if uploaded)
+# Optional font
 font_path = None
-if font_file is not None:
+font_file = st.session_state.get("font_file_widget", None)  # just to avoid linter noise
+# The actual uploader lives in the sidebar form above; re-read here:
+# (Streamlit re-runs; we reopen the uploaded file only when building PDF)
+with st.sidebar:
+    pass
+
+# Prepare optional font path (saved to a temp file if uploaded)
+# We need to re-access the uploaded file from the form widget:
+for k in st.session_state:
+    pass
+# Actually, we already consumed logo/font inside the form; re-open now:
+# Streamlit keeps `font_file` object alive; we can use it directly:
+# Build logo bytes
+logo_bytes = None
+# We can't reuse logo_file beyond the form scope reliably; offer a second uploader outside if needed.
+# To keep it simple, ask user to upload again if logo missing on PDF.
+
+# Safer approach: keep the controls inside the form and build PDF immediately after
+# re-asking for font and logo objects:
+st.markdown("## PDF")
+colA, colB = st.columns(2)
+with colA:
+    logo_u2 = st.file_uploader("Logo (PNG/JPG) for PDF export", type=["png","jpg","jpeg"], key="logo_u2")
+with colB:
+    font_u2 = st.file_uploader("Unicode font (TTF/OTF) for PDF export", type=["ttf","otf"], key="font_u2")
+
+if logo_u2 is not None:
+    try:
+        logo_bytes = BytesIO(logo_u2.read())
+    except Exception:
+        logo_bytes = None
+
+if font_u2 is not None:
     try:
         tmp_font = tempfile.NamedTemporaryFile(delete=False, suffix=".ttf")
-        tmp_font.write(font_file.read()); tmp_font.flush()
+        tmp_font.write(font_u2.read()); tmp_font.flush()
         font_path = tmp_font.name
     except Exception:
         font_path = None
 
-# Pass logo bytes (raw) to build_pdf
-logo_bytes = None
-if logo_file is not None:
-    try:
-        logo_bytes = BytesIO(logo_file.read())
-    except Exception:
-        logo_bytes = None
-
 pdf_bytes = build_pdf({
-    "title": report_title,
+    "title": st.session_state.get("report_title", "Moist Air Report") if "report_title" in st.session_state else "Moist Air Report",
     "logo_bytes": logo_bytes,
-    "notes_text": notes_text,
-    "sections": sections,
+    "notes_text": st.session_state.get("notes_text", "") if "notes_text" in st.session_state else "",
+    "sections": st.session_state.get("sections", ["Inputs","Inlet state","Outlet state","Flows & rates","Condensate","Notes"]),
     "inputs": inputs_dict,
     "inlet": inlet_dict,
     "outlet": outlet_dict,
@@ -547,7 +591,7 @@ st.download_button("📄 Download PDF report", data=pdf_bytes,
                    use_container_width=True)
 
 st.caption(
-    "Enthalpy is reported per kg of dry air (psychrometric standard) and per kg of moist air. "
-    "Ḣ = ṁ₍da₎·h; capacity Q̇ from Δh uses the inlet-based ṁ₍da₎ derived from your m³/s input. "
-    "Upload a Unicode TTF for full symbol support in the PDF."
+    "Pinned to Python 3.11 to ensure binary wheels install. "
+    "No SciPy required. Upload a Unicode TTF for full symbol support in the PDF; "
+    "otherwise the app auto-sanitizes to ASCII-safe text."
 )
