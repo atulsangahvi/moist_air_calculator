@@ -1,18 +1,19 @@
-# Moist Air Calculator — Streamlit
-# HVAC-friendly: you enter volumetric flow (m³/s at inlet). App computes moist- and dry-air mass flows.
-# Features:
-#  • Inputs: DB + (RH or WB), pressure (sea level or custom), V̇_air (m³/s), Q̇ (kW)
-#  • Outputs: named psychrometrics + transport properties
-#  • Water content (g/kg_da, g/s) and condensate when cooling to saturation
-#  • Free-typing numeric fields; press Enter / button to apply
+# Moist Air Calculator — HVAC Volumetric Flow (m³/s) + Dual Enthalpy + PDF Export
+# - Input: DB + (RH or WB), Pressure, Volumetric flow at inlet (m³/s), Heat rate Q̇ (kW)
+# - Output: Psychrometrics, transport props, enthalpy (per kg_dry & per kg_moist),
+#           enthalpy flow at each state (kW), process capacity (kW), condensate if any,
+#           implied outlet volumetric flow.
+# - PDF: customizable title, logo, notes, and section order.
 
 import sys, platform
+from io import BytesIO
 import streamlit as st
 import numpy as np
 from scipy.optimize import root_scalar
 from CoolProp.CoolProp import HAPropsSI
+from fpdf import FPDF
 
-st.set_page_config(page_title="Moist Air Calculator (HVAC volumetric flow)", layout="wide")
+st.set_page_config(page_title="Moist Air Calculator (HVAC volumetric + PDF)", layout="wide")
 ATM_P = 101325.0
 
 # -------------------- helpers: numeric text inputs --------------------
@@ -87,7 +88,7 @@ def humid_air_props(T_K, P_Pa=ATM_P, RH=None, W=None):
 
     # psychrometrics
     try:
-        h   = HAPropsSI('H','T',T_K,'P',P_Pa,'W',W)
+        h   = HAPropsSI('H','T',T_K,'P',P_Pa,'W',W)      # J/kg_dry
     except Exception:
         T_C = T_K - 273.15
         h_kJ = 1.006*T_C + W*(2501.0 + 1.86*T_C)
@@ -174,59 +175,145 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P=ATM_P):
         }
         return s2, "Cooling with condensation (final state saturated).", condensate
     except Exception as e:
-        # Fallback: constant-W estimate
         cp1 = s1['cp']
         T2_guess = np.clip(T1 + (h2_target - h1)/max(cp1,1e-9), T_lo, T_hi)
         s2 = humid_air_props(T2_guess, P, W=W1); s2['T'] = T2_guess
         return s2, f"Dry fallback — check inputs. ({e})", None
 
 # -------------------- display helpers --------------------
-def named_block(label, items):
-    st.markdown(f"### {label}")
-    for name, value, unit in items:
-        st.write(f"**{name}**: {value} {unit}")
-    st.divider()
+def enthalpy_dual(s):
+    """Return tuple: (h_dry_kJkgda, h_moist_kJkg)"""
+    h_dry_kJkgda = s['h']/1000.0
+    h_moist_kJkg = h_dry_kJkgda / (1.0 + s['W'])
+    return h_dry_kJkgda, h_moist_kJkg
 
-def state_blocks(title, s, Vdot_m3s=None, m_dry=None):
+def state_table(title, s, Vdot_in=None, m_dry=None, show_flows=True, show_outlet_vol=False):
     T_C   = s['T'] - 273.15
     Twb_C = s['Twb'] - 273.15
     Tdp_C = s['Tdp'] - 273.15
     v     = 1.0/max(s['rho'],1e-12)
     W_gkg = s['W']*1000.0
-    items_main = [
-        ("Dry-bulb temperature (DB)", f"{T_C:.2f}", "°C"),
-        ("Wet-bulb temperature (WB)", f"{Twb_C:.2f}", "°C"),
-        ("Dew-point temperature (DP)", f"{Tdp_C:.2f}", "°C"),
-        ("Relative humidity (RH)", f"{s['RH']*100:.2f}", "%"),
-        ("Humidity ratio (W)", f"{W_gkg:.3f}", "g/kg dry air"),
-        ("Enthalpy (h)", f"{s['h']/1000.0:.3f}", "kJ/kg dry air"),
-    ]
-    items_props = [
-        ("Density (ρ)", f"{s['rho']:.4f}", "kg/m³"),
-        ("Specific volume (v)", f"{v:.4f}", "m³/kg dry air"),
-        ("Specific heat (cp)", f"{s['cp']:.1f}", "J/kg·K"),
-        ("Thermal conductivity (k)", f"{s['k']:.5f}", "W/m·K"),
-        ("Dynamic viscosity (μ)", f"{s['mu']:.7f}", "Pa·s"),
-        ("Prandtl number (Pr)", f"{s['Pr']:.3f}", "–"),
-        ("Kinematic viscosity (ν)", f"{s['nu']:.7e}", "m²/s"),
-        ("Thermal diffusivity (α)", f"{s['alpha']:.7e}", "m²/s"),
-    ]
+    h_dry, h_moist = enthalpy_dual(s)
 
     st.subheader(title)
-    named_block("Psychrometric state", items_main)
-    named_block("Transport & derived properties", items_props)
+    st.markdown("### Psychrometric state")
+    st.write(f"**Dry-bulb (DB):** {T_C:.2f} °C")
+    st.write(f"**Wet-bulb (WB):** {Twb_C:.2f} °C")
+    st.write(f"**Dew-point (DP):** {Tdp_C:.2f} °C")
+    st.write(f"**Relative humidity (RH):** {s['RH']*100:.2f} %")
+    st.write(f"**Humidity ratio (W):** {W_gkg:.3f} g/kg dry air")
+    st.write(f"**Enthalpy per kg dry air (hᵈʳʸ):** {h_dry:.3f} kJ/kg₍da₎")
+    st.write(f"**Enthalpy per kg moist air (hᵐᵒᶦˢᵗ):** {h_moist:.3f} kJ/kg₍moist₎")
 
-    if Vdot_m3s is not None and m_dry is not None:
-        m_moist = s['rho'] * Vdot_m3s
-        water_g_s = s['W'] * m_dry * 1000.0  # kg/s_vapor = W * kg/s_dry
-        named_block("Flow conversions (based on inlet state for this column)",
-            [("Volumetric flow (V̇_air)", f"{Vdot_m3s:.3f}", "m³/s"),
-             ("Moist-air mass flow (ṁ_moist ≈ ρ·V̇)", f"{m_moist:.3f}", "kg/s"),
-             ("Dry-air mass flow (ṁ_dry = ṁ_moist/(1+W))", f"{m_dry:.3f}", "kg_dry/s"),
-             ("Water mass flow in stream (ṁ_w = W·ṁ_dry)", f"{water_g_s:.2f}", "g/s")] )
+    st.markdown("### Transport & derived")
+    st.write(f"**Density (ρ):** {s['rho']:.4f} kg/m³")
+    st.write(f"**Specific volume (v):** {v:.4f} m³/kg₍da₎")
+    st.write(f"**Specific heat (cp):** {s['cp']:.1f} J/kg·K")
+    st.write(f"**Thermal conductivity (k):** {s['k']:.5f} W/m·K")
+    st.write(f"**Dynamic viscosity (μ):** {s['mu']:.7f} Pa·s")
+    st.write(f"**Prandtl number (Pr):** {s['Pr']:.3f}")
+    st.write(f"**Kinematic viscosity (ν):** {s['nu']:.7e} m²/s")
+    st.write(f"**Thermal diffusivity (α):** {s['alpha']:.7e} m²/s")
+
+    if show_flows and Vdot_in is not None and m_dry is not None:
+        m_moist = s['rho'] * Vdot_in
+        water_g_s = s['W'] * m_dry * 1000.0
+        st.markdown("### Flow conversions (based on this state's density)")
+        st.write(f"**Volumetric flow (V̇_air):** {Vdot_in:.3f} m³/s")
+        st.write(f"**Moist-air mass flow (ṁ_moist ≈ ρ·V̇):** {m_moist:.3f} kg/s")
+        st.write(f"**Dry-air mass flow (ṁ_dry = ṁ_moist/(1+W)):** {m_dry:.3f} kg₍da₎/s")
+        st.write(f"**Water mass flow in stream (ṁ_w = W·ṁ_dry):** {water_g_s:.2f} g/s")
+
+    if show_outlet_vol and m_dry is not None:
+        # implied outlet volumetric flow corresponding to THIS state's density
+        Vdot_state = (1.0 + s['W']) * m_dry / max(s['rho'], 1e-12)
+        st.write(f"**Implied volumetric flow at this state:** {Vdot_state:.3f} m³/s")
+
+def process_capacity_block(s1, s2, m_dot_dry):
+    h1 = s1['h']; h2 = s2['h']  # J/kg_da
+    q_kW = m_dot_dry * (h2 - h1) / 1000.0  # kW
+    st.markdown("### Process capacity from enthalpy change")
+    st.write(f"**Total capacity (Q̇ = ṁ₍da₎·Δh):** {q_kW:.3f} kW")
+    # Enthalpy flow at each state (they are equal whether you use moist or dry basis)
+    hdry1, hmoist1 = enthalpy_dual(s1)
+    hdry2, hmoist2 = enthalpy_dual(s2)
+    Hdot1 = m_dot_dry * hdry1 / 1.0  # kW per (kJ/s) since kJ/kg * kg/s = kJ/s
+    Hdot2 = m_dot_dry * hdry2 / 1.0
+    st.write(f"**Enthalpy flow at inlet:** {Hdot1:.3f} kW  (per kg₍da₎ basis)")
+    st.write(f"**Enthalpy flow at outlet:** {Hdot2:.3f} kW  (per kg₍da₎ basis)")
+    return q_kW
+
+# -------------------- PDF builder --------------------
+def build_pdf(data):
+    """
+    data: dict with keys:
+      title, logo_bytes|None, notes_text,
+      sections (ordered list of strings),
+      inputs (dict of label->value),
+      inlet (dict of label->value),
+      outlet (dict of label->value),
+      flows (dict),
+      capacity (dict),
+      condensate (dict or None)
+    """
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, data.get("title","Moist Air Report"), 0, 1, "C")
+
+    # logo (optional)
+    if data.get("logo_bytes"):
+        try:
+            # top-right corner
+            pdf.image(data["logo_bytes"], x=170, y=10, w=25)
+        except Exception:
+            pass
+
+    def section_header(txt):
+        pdf.set_font("Arial", "B", 12)
+        pdf.ln(2); pdf.cell(0, 8, txt, 0, 1)
+
+    def kv_table(d):
+        pdf.set_font("Arial", "", 10)
+        for k, v in d.items():
+            pdf.cell(90, 6, f"{k}:", 0, 0)
+            pdf.cell(0, 6, f"{v}", 0, 1)
+
+    # render selected sections in chosen order
+    for sec in data.get("sections", []):
+        if sec == "Inputs":
+            section_header("Inputs")
+            kv_table(data.get("inputs", {}))
+        elif sec == "Inlet state":
+            section_header("Inlet state")
+            kv_table(data.get("inlet", {}))
+        elif sec == "Outlet state":
+            section_header("Outlet state")
+            kv_table(data.get("outlet", {}))
+        elif sec == "Flows & rates":
+            section_header("Flows & rates")
+            kv_table(data.get("flows", {}))
+            kv_table(data.get("capacity", {}))
+        elif sec == "Condensate":
+            if data.get("condensate"):
+                section_header("Condensate")
+                kv_table(data.get("condensate", {}))
+        elif sec == "Notes":
+            notes = data.get("notes_text","").strip()
+            if notes:
+                section_header("Notes")
+                pdf.set_font("Arial", "", 10)
+                # simple wrapped text
+                for line in notes.splitlines():
+                    pdf.multi_cell(0, 6, line)
+
+    bio = BytesIO()
+    pdf.output(bio)
+    return bio.getvalue()
 
 # -------------------- UI --------------------
-st.title("Moist Air Calculator — HVAC Volumetric Flow (m³/s)")
+st.title("Moist Air Calculator — HVAC Volumetric Flow (m³/s) + PDF")
 
 with st.sidebar.form("inputs_form", clear_on_submit=False):
     st.header("Inputs")
@@ -246,7 +333,17 @@ with st.sidebar.form("inputs_form", clear_on_submit=False):
 
     st.header("Process (Q̇ on flowing air)")
     Vdot_txt = text_num("Volumetric flow V̇_air (m³/s) — at inlet", "txt_vdot", "1.20")
-    qdot_txt = text_num("Heat rate Q̇ (kW)  (+heating / −cooling)", "txt_qdot", "-5.0")
+    qdot_txt = text_num("External heat rate Q̇ (kW)  (+heating / −cooling)", "txt_qdot", "-5.0")
+
+    st.header("PDF options")
+    report_title = st.text_input("Report title", value="Moist Air Report")
+    logo_file = st.file_uploader("Logo (PNG/JPG)", type=["png","jpg","jpeg"])
+    notes_text = st.text_area("Notes (optional)", height=120, placeholder="Type any comments, headings, or bullet points here...")
+    sections = st.multiselect(
+        "Select sections (click in your desired order)",
+        ["Inputs","Inlet state","Outlet state","Flows & rates","Condensate","Notes"],
+        default=["Inputs","Inlet state","Outlet state","Flows & rates","Condensate","Notes"],
+    )
 
     submitted = st.form_submit_button("Update / Calculate", use_container_width=True)
 
@@ -298,39 +395,111 @@ s1 = state_from_DB_RH(Tdb_C, RH_pct, P) if RH_pct is not None else state_from_DB
 
 # Convert HVAC volumetric flow -> mass flows (inlet basis)
 rho1 = s1['rho']; W1 = s1['W']
-m_dot_moist = rho1 * Vdot_m3s                  # kg moist air / s
-m_dot_dry   = m_dot_moist / (1.0 + W1)         # kg dry air / s  (used for balances)
+m_dot_moist_in = rho1 * Vdot_m3s                # kg moist air / s
+m_dot_dry       = m_dot_moist_in / (1.0 + W1)   # kg dry air / s  (used for balances)
 
 # ---- solve outlet state ----
 s2, note, condensate = final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P)
 
-# -------------------- display --------------------
+# implied outlet volumetric flow (density & W at outlet)
+Vdot_out = (1.0 + s2['W']) * m_dot_dry / max(s2['rho'], 1e-12)
+
+# ---- display ----
 col1, col2 = st.columns(2)
 with col1:
-    state_blocks("Initial State", s1, Vdot_m3s=Vdot_m3s, m_dry=m_dot_dry)
+    state_table("Initial State", s1, Vdot_in=Vdot_m3s, m_dry=m_dot_dry, show_flows=True, show_outlet_vol=False)
 with col2:
-    # For display, show the same inlet volumetric flow; mass flows differ at outlet due to density change,
-    # but ṁ_dry remains the same through the process.
-    state_blocks("Final State (after Q̇)", s2, Vdot_m3s=Vdot_m3s, m_dry=m_dot_dry)
+    state_table("Final State (after Q̇)", s2, Vdot_in=Vdot_m3s, m_dry=m_dot_dry, show_flows=True, show_outlet_vol=True)
+    st.write(f"**Implied outlet volumetric flow (V̇_out):** {Vdot_out:.3f} m³/s")
     st.info(note)
-    if condensate is not None:
-        st.markdown("### Condensate removed (due to cooling)")
-        for name, value, unit in [
-            ("Water removed per kg dry air (ΔW)", f"{condensate['dW_g_per_kg']:.2f}", "g/kg dry air"),
-            ("Condensate mass flow", f"{condensate['mdot_g_s']:.2f}", "g/s"),
-            ("Condensate mass flow", f"{condensate['mdot_kg_h']:.3f}", "kg/h"),
-            ("Condensate volume flow (≈ water)", f"{condensate['vol_mL_s']:.1f}", "mL/s"),
-            ("Condensate volume flow (≈ water)", f"{condensate['vol_L_h']:.3f}", "L/h"),
-        ]:
-            st.write(f"**{name}**: {value} {unit}")
+
+st.markdown("## Capacity")
+q_kW = process_capacity_block(s1, s2, m_dot_dry)
+
+if condensate is not None:
+    st.markdown("## Condensate (due to cooling)")
+    st.write(f"**Water removed per kg dry air (ΔW):** {condensate['dW_g_per_kg']:.2f} g/kg₍da₎")
+    st.write(f"**Condensate mass flow:** {condensate['mdot_g_s']:.2f} g/s ({condensate['mdot_kg_h']:.3f} kg/h)")
+    st.write(f"**Condensate volume flow (≈ water):** {condensate['vol_mL_s']:.1f} mL/s ({condensate['vol_L_h']:.3f} L/h)")
 
 with st.expander("App diagnostics", expanded=False):
     st.write({"CoolProp": getattr(sys.modules.get('CoolProp'), '__version__', 'unknown'),
               "Python": sys.version.split()[0],
               "Platform": platform.platform()})
 
+# ---- Build PDF dicts ----
+h1_dry, h1_moist = enthalpy_dual(s1)
+h2_dry, h2_moist = enthalpy_dual(s2)
+inputs_dict = {
+    "Pressure": f"{P:.0f} Pa",
+    "Mode": "DB + RH" if RH_pct is not None else "DB + WB",
+    "Dry-bulb (°C)": f"{Tdb_C:.2f}",
+    "Relative Humidity (%)": f"{RH_pct:.2f}" if RH_pct is not None else "—",
+    "Wet-bulb (°C)": f"{Twb_C:.2f}" if Twb_C is not None else "—",
+    "Volumetric flow V̇_in": f"{Vdot_m3s:.3f} m³/s",
+    "External heat rate Q̇": f"{Qdot_kW:.3f} kW",
+}
+inlet_dict = {
+    "DB / WB / DP (°C)": f"{s1['T']-273.15:.2f} / {s1['Twb']-273.15:.2f} / {s1['Tdp']-273.15:.2f}",
+    "RH (%)": f"{s1['RH']*100:.2f}",
+    "W (g/kg₍da₎)": f"{s1['W']*1000.0:.3f}",
+    "h per kg dry (kJ/kg₍da₎)": f"{h1_dry:.3f}",
+    "h per kg moist (kJ/kg₍moist₎)": f"{h1_moist:.3f}",
+    "ρ (kg/m³)": f"{s1['rho']:.4f}",
+}
+outlet_dict = {
+    "DB / WB / DP (°C)": f"{s2['T']-273.15:.2f} / {s2['Twb']-273.15:.2f} / {s2['Tdp']-273.15:.2f}",
+    "RH (%)": f"{s2['RH']*100:.2f}",
+    "W (g/kg₍da₎)": f"{s2['W']*1000.0:.3f}",
+    "h per kg dry (kJ/kg₍da₎)": f"{h2_dry:.3f}",
+    "h per kg moist (kJ/kg₍moist₎)": f"{h2_moist:.3f}",
+    "ρ (kg/m³)": f"{s2['rho']:.4f}",
+}
+flows_dict = {
+    "ṁ_moist (kg/s) @ inlet": f"{m_dot_moist_in:.3f}",
+    "ṁ_dry (kg₍da₎/s)": f"{m_dot_dry:.3f}",
+    "V̇_in (m³/s)": f"{Vdot_m3s:.3f}",
+    "V̇_out implied (m³/s)": f"{Vdot_out:.3f}",
+}
+capacity_dict = {
+    "Q̇ from Δh (kW)": f"{q_kW:.3f}",
+    "Ḣ_in (kW)": f"{(m_dot_dry*h1_dry):.3f}",
+    "Ḣ_out (kW)": f"{(m_dot_dry*h2_dry):.3f}",
+}
+cond_dict = None
+if condensate is not None:
+    cond_dict = {
+        "ΔW (g/kg₍da₎)": f"{condensate['dW_g_per_kg']:.2f}",
+        "ṁ_cond (g/s)": f"{condensate['mdot_g_s']:.2f}",
+        "ṁ_cond (kg/h)": f"{condensate['mdot_kg_h']:.3f}",
+        "V̇_cond (mL/s)": f"{condensate['vol_mL_s']:.1f}",
+        "V̇_cond (L/h)": f"{condensate['vol_L_h']:.3f}",
+    }
+
+# ---- PDF download ----
+logo_bytes = None
+if logo_file is not None:
+    try:
+        logo_bytes = BytesIO(logo_file.read())
+    except Exception:
+        logo_bytes = None
+
+pdf_bytes = build_pdf({
+    "title": report_title,
+    "logo_bytes": logo_bytes,
+    "notes_text": notes_text,
+    "sections": sections,
+    "inputs": inputs_dict,
+    "inlet": inlet_dict,
+    "outlet": outlet_dict,
+    "flows": flows_dict,
+    "capacity": capacity_dict,
+    "condensate": cond_dict,
+})
+st.download_button("📄 Download PDF report", data=pdf_bytes, file_name="moist_air_report.pdf",
+                   mime="application/pdf", use_container_width=True)
+
 st.caption(
-    "Volumetric flow V̇_air is taken at the inlet state to compute ṁ_moist and ṁ_dry. "
-    "Energy and mass balances use dry-air basis (psychrometric standard). "
-    "Type freely in any field, then press Enter or click the button to apply."
+    "Enthalpy is reported per kg of dry air (psychrometric standard) and per kg of moist air. "
+    "Enthalpy flow Ḣ = ṁ₍da₎·h; capacity Q̇ from Δh uses the inlet-based ṁ₍da₎ derived from your m³/s input."
 )
