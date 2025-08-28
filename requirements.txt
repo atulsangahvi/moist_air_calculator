@@ -1,8 +1,5 @@
-streamlit>=1.22.0
-pandas>=1.5.0
-numpy>=1.24.0
-matplotlib>=3.6.0
-scipy>=1.10.0
-coolprop>=6.4.0
-reportlab
-fpdf
+streamlit>=1.36,<2
+numpy>=1.26,<2.0
+scipy>=1.11,<1.14
+CoolProp>=6.6,<7
+fpdf2>=2.7
