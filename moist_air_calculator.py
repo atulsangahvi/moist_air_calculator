@@ -1,6 +1,7 @@
 # Moist Air Calculator — HVAC Volumetric Flow (m³/s) + Dual Enthalpy + Unicode-Safe PDF
 # - No SciPy required (pure-Python bisection for root-finding)
 # - Pin Python 3.11 (via runtime.txt) so CoolProp/Numpy wheels are available
+# - Recommend fpdf2>=2.7.8 for fewer encoding edge cases
 
 import sys, platform, tempfile
 from io import BytesIO
@@ -534,24 +535,11 @@ if condensate is not None:
 # Optional font
 font_path = None
 font_file = st.session_state.get("font_file_widget", None)  # just to avoid linter noise
-# The actual uploader lives in the sidebar form above; re-read here:
-# (Streamlit re-runs; we reopen the uploaded file only when building PDF)
 with st.sidebar:
     pass
 
 # Prepare optional font path (saved to a temp file if uploaded)
-# We need to re-access the uploaded file from the form widget:
-for k in st.session_state:
-    pass
-# Actually, we already consumed logo/font inside the form; re-open now:
-# Streamlit keeps `font_file` object alive; we can use it directly:
-# Build logo bytes
 logo_bytes = None
-# We can't reuse logo_file beyond the form scope reliably; offer a second uploader outside if needed.
-# To keep it simple, ask user to upload again if logo missing on PDF.
-
-# Safer approach: keep the controls inside the form and build PDF immediately after
-# re-asking for font and logo objects:
 st.markdown("## PDF")
 colA, colB = st.columns(2)
 with colA:
@@ -585,6 +573,29 @@ pdf_bytes = build_pdf({
     "capacity": capacity_dict,
     "condensate": cond_dict,
 }, font_path=font_path)
+
+# -------------------- NEW: bulletproof coercion to bytes for Streamlit --------------------
+def _coerce_to_bytes(x):
+    if x is None:
+        return b""
+    if isinstance(x, bytes):
+        return x
+    if isinstance(x, bytearray):
+        return bytes(x)
+    if isinstance(x, memoryview):
+        return x.tobytes()
+    if isinstance(x, str):
+        return x.encode("latin-1", "ignore")
+    if hasattr(x, "getvalue"):  # BytesIO-like
+        return x.getvalue()
+    if hasattr(x, "read"):      # file-like
+        return x.read()
+    raise TypeError(f"Unsupported type for download: {type(x)}")
+
+pdf_bytes = _coerce_to_bytes(pdf_bytes)
+
+with st.expander("PDF debug", expanded=False):
+    st.write({"type(pdf_bytes)": str(type(pdf_bytes)), "len(pdf_bytes)": len(pdf_bytes)})
 
 st.download_button("📄 Download PDF report", data=pdf_bytes,
                    file_name="moist_air_report.pdf", mime="application/pdf",
