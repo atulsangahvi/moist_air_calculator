@@ -1,10 +1,10 @@
 # Moist Air Calculator — Streamlit
-# Text-input numeric fields so you can highlight/backspace/paste, then press Enter to apply.
+# HVAC-friendly: you enter volumetric flow (m³/s at inlet). App computes moist- and dry-air mass flows.
 # Features:
-#  • Inputs: DB + (RH or WB), pressure (sea level or custom)
+#  • Inputs: DB + (RH or WB), pressure (sea level or custom), V̇_air (m³/s), Q̇ (kW)
 #  • Outputs: named psychrometrics + transport properties
 #  • Water content (g/kg_da, g/s) and condensate when cooling to saturation
-#  • Robust parsing (accepts commas or scientific notation), clear validation
+#  • Free-typing numeric fields; press Enter / button to apply
 
 import sys, platform
 import streamlit as st
@@ -12,20 +12,14 @@ import numpy as np
 from scipy.optimize import root_scalar
 from CoolProp.CoolProp import HAPropsSI
 
-st.set_page_config(page_title="Moist Air Calculator", layout="wide")
+st.set_page_config(page_title="Moist Air Calculator (HVAC volumetric flow)", layout="wide")
 ATM_P = 101325.0
 
 # -------------------- helpers: numeric text inputs --------------------
 def parse_number(text, *, min_val=None, max_val=None, field_name="value"):
-    """
-    Parse a numeric string (accepts commas, sci-notation). Returns float.
-    Raises ValueError with a helpful message if invalid / out of range.
-    """
-    if text is None:
-        raise ValueError(f"{field_name}: empty.")
+    if text is None: raise ValueError(f"{field_name}: empty.")
     s = text.strip().replace(",", ".")
-    if s == "":
-        raise ValueError(f"{field_name}: empty.")
+    if s == "": raise ValueError(f"{field_name}: empty.")
     try:
         x = float(s)
     except Exception:
@@ -37,7 +31,6 @@ def parse_number(text, *, min_val=None, max_val=None, field_name="value"):
     return x
 
 def text_num(label, key, default_str, help=None):
-    # initialize session default
     if key not in st.session_state:
         st.session_state[key] = default_str
     return st.text_input(label, key=key, help=help)
@@ -137,14 +130,15 @@ def state_from_DB_WB(Tdb_C, Twb_C, P=ATM_P):
         W = HAPropsSI('W','T',T,'P',P,'R',0.5)
     s = humid_air_props(T, P, W=W); s['T'] = T; return s
 
-def final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P=ATM_P):
-    """Return (s2, note, condensate_dict|None)."""
-    if abs(Qdot_kW) < 1e-12 or m_dot_air <= 1e-12:
+# ---------- Process solver (Q̇ on flowing air) ----------
+def final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P=ATM_P):
+    """Return (s2, note, condensate_dict|None). Uses dry-air mass flow for balances."""
+    if abs(Qdot_kW) < 1e-12 or m_dot_dry <= 1e-12:
         return s1.copy(), "No change (zero heat or zero mass flow).", None
 
-    h1 = s1['h']; W1 = s1['W']; T1 = s1['T']
-    q_per_kg = (Qdot_kW*1000.0)/m_dot_air  # J per kg dry air
-    h2_target = h1 + q_per_kg
+    h1, W1, T1 = s1['h'], s1['W'], s1['T']
+    q_per_kg_dry = (Qdot_kW*1000.0) / m_dot_dry  # J per kg_dry
+    h2_target = h1 + q_per_kg_dry
 
     # Dry (constant-W) attempt
     def h_at_T_constW(T): return HAPropsSI('H','T',T,'P',P,'W',W1)
@@ -153,7 +147,7 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P=ATM_P):
         T2_dry = root_scalar(lambda T: h_at_T_constW(T) - h2_target,
                              bracket=[T_lo, T_hi], method='bisect').root
         RH2 = HAPropsSI('R','T',T2_dry,'P',P,'W',W1)
-        if RH2 <= 0.999 or q_per_kg >= 0:
+        if RH2 <= 0.999 or q_per_kg_dry >= 0:
             s2 = humid_air_props(T2_dry, P, W=W1); s2['T'] = T2_dry
             return s2, "Dry process (W constant).", None
     except Exception:
@@ -169,8 +163,8 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P=ATM_P):
         W2 = HAPropsSI('W','T',T2,'P',P,'R',0.999)
         s2 = humid_air_props(T2, P, W=W2); s2['T'] = T2
 
-        dW = max(0.0, W1 - W2)                # kg/kg_da
-        mdot_cond_kg_s = dW * m_dot_air       # kg/s
+        dW = max(0.0, W1 - W2)                 # kg_vapor/kg_dry removed
+        mdot_cond_kg_s = dW * m_dot_dry        # kg/s
         condensate = {
             'dW_g_per_kg': 1000.0*dW,
             'mdot_g_s': 1000.0*mdot_cond_kg_s,
@@ -181,102 +175,19 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P=ATM_P):
         return s2, "Cooling with condensation (final state saturated).", condensate
     except Exception as e:
         # Fallback: constant-W estimate
-        T2_guess = np.clip(T1 + q_per_kg/max(s1['cp'],1e-9), T_lo, T_hi)
+        cp1 = s1['cp']
+        T2_guess = np.clip(T1 + (h2_target - h1)/max(cp1,1e-9), T_lo, T_hi)
         s2 = humid_air_props(T2_guess, P, W=W1); s2['T'] = T2_guess
         return s2, f"Dry fallback — check inputs. ({e})", None
 
-# -------------------- UI --------------------
-st.title("Moist Air Calculator (free-typing inputs + Enter)")
-
-with st.sidebar.form("inputs_form", clear_on_submit=False):
-    st.header("Inputs")
-
-    P_mode = st.selectbox("Pressure mode", ["Sea level (101325 Pa)", "Custom (Pa)"], index=0)
-    P_txt  = text_num("Pressure (Pa)", "txt_P", "101325", help="Only used if 'Custom' is selected.")
-
-    mode = st.radio("Moisture input mode", ["DB + RH", "DB + WB"], index=0)
-    Tdb_txt = text_num("Dry-bulb (°C)", "txt_Tdb", "30.0")
-
-    if mode == "DB + RH":
-        RH_txt  = text_num("Relative Humidity (%)", "txt_RH", "50.0")
-        Twb_txt = None
-    else:
-        Twb_txt = text_num("Wet-bulb (°C)", "txt_Twb", "20.0")
-        RH_txt  = None
-
-    st.header("Process (Q̇ on flowing air)")
-    mdot_txt = text_num("Air mass flow ṁ_air (kg/s, dry air basis)", "txt_mdot", "1.0")
-    qdot_txt = text_num("Heat rate Q̇ (kW)  (+heating / −cooling)", "txt_qdot", "-5.0")
-
-    submitted = st.form_submit_button("Update / Calculate", use_container_width=True)
-
-# ---- parse & validate all inputs (after submit or initial render) ----
-errors = []
-
-# Pressure
-try:
-    P_val = parse_number(P_txt, min_val=50000, max_val=120000, field_name="Pressure")
-    P = P_val if P_mode.startswith("Custom") else ATM_P
-except ValueError as e:
-    errors.append(str(e))
-    P = ATM_P
-
-# DB
-try:
-    Tdb_C = parse_number(Tdb_txt, min_val=-60.0, max_val=120.0, field_name="Dry-bulb")
-except ValueError as e:
-    errors.append(str(e))
-    Tdb_C = 30.0
-
-# RH/WB
-RH_pct = None; Twb_C = None
-if mode == "DB + RH":
-    try:
-        RH_pct = parse_number(RH_txt, min_val=1.0, max_val=99.0, field_name="Relative Humidity (%)")
-    except ValueError as e:
-        errors.append(str(e))
-        RH_pct = 50.0
-else:
-    try:
-        Twb_C = parse_number(Twb_txt, min_val=-60.0, max_val=120.0, field_name="Wet-bulb")
-    except ValueError as e:
-        errors.append(str(e))
-        Twb_C = 20.0
-    if Twb_C > Tdb_C:
-        errors.append("Wet-bulb cannot exceed Dry-bulb. It will be clamped to DB.")
-        Twb_C = Tdb_C
-
-# process inputs
-try:
-    m_dot_air = parse_number(mdot_txt, min_val=0.0, max_val=500.0, field_name="Air mass flow")
-except ValueError as e:
-    errors.append(str(e))
-    m_dot_air = 1.0
-
-try:
-    Qdot_kW = parse_number(qdot_txt, min_val=-10000.0, max_val=10000.0, field_name="Heat rate")
-except ValueError as e:
-    errors.append(str(e))
-    Qdot_kW = -5.0
-
-# Show all validation errors prominently (but still compute with safe defaults)
-if errors:
-    st.error("Please fix these inputs:")
-    for e in errors:
-        st.write("• " + e)
-
-# ---- compute states ----
-s1 = state_from_DB_RH(Tdb_C, RH_pct, P) if RH_pct is not None else state_from_DB_WB(Tdb_C, Twb_C, P)
-s2, note, condensate = final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P)
-
-# -------------------- display --------------------
+# -------------------- display helpers --------------------
 def named_block(label, items):
     st.markdown(f"### {label}")
     for name, value, unit in items:
         st.write(f"**{name}**: {value} {unit}")
     st.divider()
 
-def state_blocks(title, s, m_dot_air=None):
+def state_blocks(title, s, Vdot_m3s=None, m_dry=None):
     T_C   = s['T'] - 273.15
     Twb_C = s['Twb'] - 273.15
     Tdp_C = s['Tdp'] - 273.15
@@ -305,15 +216,102 @@ def state_blocks(title, s, m_dot_air=None):
     named_block("Psychrometric state", items_main)
     named_block("Transport & derived properties", items_props)
 
-    if m_dot_air and m_dot_air > 0:
-        water_g_s = s['W']*m_dot_air*1000.0
-        named_block("Water content in the stream", [("Water mass flow (ṁ_w)", f"{water_g_s:.2f}", "g/s")])
+    if Vdot_m3s is not None and m_dry is not None:
+        m_moist = s['rho'] * Vdot_m3s
+        water_g_s = s['W'] * m_dry * 1000.0  # kg/s_vapor = W * kg/s_dry
+        named_block("Flow conversions (based on inlet state for this column)",
+            [("Volumetric flow (V̇_air)", f"{Vdot_m3s:.3f}", "m³/s"),
+             ("Moist-air mass flow (ṁ_moist ≈ ρ·V̇)", f"{m_moist:.3f}", "kg/s"),
+             ("Dry-air mass flow (ṁ_dry = ṁ_moist/(1+W))", f"{m_dry:.3f}", "kg_dry/s"),
+             ("Water mass flow in stream (ṁ_w = W·ṁ_dry)", f"{water_g_s:.2f}", "g/s")] )
 
+# -------------------- UI --------------------
+st.title("Moist Air Calculator — HVAC Volumetric Flow (m³/s)")
+
+with st.sidebar.form("inputs_form", clear_on_submit=False):
+    st.header("Inputs")
+
+    P_mode = st.selectbox("Pressure mode", ["Sea level (101325 Pa)", "Custom (Pa)"], index=0)
+    P_txt  = text_num("Pressure (Pa)", "txt_P", "101325", help="Used if 'Custom' is selected.")
+
+    mode = st.radio("Moisture input mode", ["DB + RH", "DB + WB"], index=0)
+    Tdb_txt = text_num("Dry-bulb (°C)", "txt_Tdb", "30.0")
+
+    if mode == "DB + RH":
+        RH_txt  = text_num("Relative Humidity (%)", "txt_RH", "50.0")
+        Twb_txt = None
+    else:
+        Twb_txt = text_num("Wet-bulb (°C)", "txt_Twb", "20.0")
+        RH_txt  = None
+
+    st.header("Process (Q̇ on flowing air)")
+    Vdot_txt = text_num("Volumetric flow V̇_air (m³/s) — at inlet", "txt_vdot", "1.20")
+    qdot_txt = text_num("Heat rate Q̇ (kW)  (+heating / −cooling)", "txt_qdot", "-5.0")
+
+    submitted = st.form_submit_button("Update / Calculate", use_container_width=True)
+
+# ---- parse & validate ----
+errors = []
+
+try:
+    P_val = parse_number(P_txt, min_val=50000, max_val=120000, field_name="Pressure")
+    P = P_val if P_mode.startswith("Custom") else ATM_P
+except ValueError as e:
+    errors.append(str(e)); P = ATM_P
+
+try:
+    Tdb_C = parse_number(Tdb_txt, min_val=-60.0, max_val=120.0, field_name="Dry-bulb")
+except ValueError as e:
+    errors.append(str(e)); Tdb_C = 30.0
+
+RH_pct = None; Twb_C = None
+if mode == "DB + RH":
+    try:
+        RH_pct = parse_number(RH_txt, min_val=1.0, max_val=99.0, field_name="Relative Humidity (%)")
+    except ValueError as e:
+        errors.append(str(e)); RH_pct = 50.0
+else:
+    try:
+        Twb_C = parse_number(Twb_txt, min_val=-60.0, max_val=120.0, field_name="Wet-bulb")
+    except ValueError as e:
+        errors.append(str(e)); Twb_C = 20.0
+    if Twb_C > Tdb_C:
+        errors.append("Wet-bulb cannot exceed Dry-bulb. It will be clamped to DB.")
+        Twb_C = Tdb_C
+
+try:
+    Vdot_m3s = parse_number(Vdot_txt, min_val=0.0, max_val=500.0, field_name="Volumetric flow V̇_air")
+except ValueError as e:
+    errors.append(str(e)); Vdot_m3s = 1.2
+
+try:
+    Qdot_kW = parse_number(qdot_txt, min_val=-10000.0, max_val=10000.0, field_name="Heat rate")
+except ValueError as e:
+    errors.append(str(e)); Qdot_kW = -5.0
+
+if errors:
+    st.error("Please fix these inputs:")
+    for e in errors: st.write("• " + e)
+
+# ---- compute inlet state ----
+s1 = state_from_DB_RH(Tdb_C, RH_pct, P) if RH_pct is not None else state_from_DB_WB(Tdb_C, Twb_C, P)
+
+# Convert HVAC volumetric flow -> mass flows (inlet basis)
+rho1 = s1['rho']; W1 = s1['W']
+m_dot_moist = rho1 * Vdot_m3s                  # kg moist air / s
+m_dot_dry   = m_dot_moist / (1.0 + W1)         # kg dry air / s  (used for balances)
+
+# ---- solve outlet state ----
+s2, note, condensate = final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P)
+
+# -------------------- display --------------------
 col1, col2 = st.columns(2)
 with col1:
-    state_blocks("Initial State", s1, m_dot_air=m_dot_air)
+    state_blocks("Initial State", s1, Vdot_m3s=Vdot_m3s, m_dry=m_dot_dry)
 with col2:
-    state_blocks("Final State (after Q̇)", s2, m_dot_air=m_dot_air)
+    # For display, show the same inlet volumetric flow; mass flows differ at outlet due to density change,
+    # but ṁ_dry remains the same through the process.
+    state_blocks("Final State (after Q̇)", s2, Vdot_m3s=Vdot_m3s, m_dry=m_dot_dry)
     st.info(note)
     if condensate is not None:
         st.markdown("### Condensate removed (due to cooling)")
@@ -331,4 +329,8 @@ with st.expander("App diagnostics", expanded=False):
               "Python": sys.version.split()[0],
               "Platform": platform.platform()})
 
-st.caption("Type freely in any field (commas or scientific notation OK), then press Enter or click the button to apply.")
+st.caption(
+    "Volumetric flow V̇_air is taken at the inlet state to compute ṁ_moist and ṁ_dry. "
+    "Energy and mass balances use dry-air basis (psychrometric standard). "
+    "Type freely in any field, then press Enter or click the button to apply."
+)
