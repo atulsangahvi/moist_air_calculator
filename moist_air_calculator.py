@@ -1,68 +1,23 @@
-# Moist Air Calculator — Streamlit (safe version)
-# - Inputs: DB + (RH or WB), pressure; m_dot_air, Q̇
-# - Outputs: named properties + water content + condensate (if any)
-# - Crash guards: shows clear error on import/compute issues (no blank page)
+# Moist Air Calculator — Streamlit (form-based inputs so Enter works)
+# - Type in any field, press Enter (or the button) to apply changes.
+# - DB + (RH or WB), pressure; computes full moist-air properties.
+# - Apply Q̇ with m_dot_air; reports condensate when cooling to saturation.
 
 import sys, platform
 import streamlit as st
 st.set_page_config(page_title="Moist Air Calculator", layout="wide")
 
-# ---- Import dependencies with guards (prevents blank page) ----
-err_msgs = []
-try:
-    import numpy as np
-except Exception as e:
-    err_msgs.append(f"NumPy import failed: {e}")
-try:
-    from scipy.optimize import root_scalar
-except Exception as e:
-    err_msgs.append(f"SciPy import failed: {e}")
+# ---- imports with minimal guards ----
+import numpy as np
+from scipy.optimize import root_scalar
+from CoolProp.CoolProp import HAPropsSI
 
-COOLPROP_OK = True
-try:
-    from CoolProp.CoolProp import HAPropsSI
-    import CoolProp
-    COOLPROP_VER = getattr(CoolProp, "__version__", "unknown")
-except Exception as e:
-    COOLPROP_OK = False
-    COOLPROP_ERR = e
-
-# ---- Early diagnostics (if anything is wrong, show it and stop) ----
-if err_msgs or not COOLPROP_OK:
-    st.title("Moist Air Calculator")
-    st.error("The app couldn't start correctly.")
-    if err_msgs:
-        for m in err_msgs:
-            st.exception(RuntimeError(m))
-    if not COOLPROP_OK:
-        st.error("CoolProp failed to import (required for psychrometrics).")
-        st.exception(COOLPROP_ERR)
-        st.info(
-            "Try: `pip install --upgrade CoolProp` (ensure a wheel is available for your platform). "
-            "After installing, rerun: `streamlit run moist_air_app.py`."
-        )
-    with st.expander("Environment info"):
-        st.write({
-            "Python": sys.version,
-            "Platform": platform.platform(),
-        })
-    st.stop()
-
-# ----------------- constants -----------------
 ATM_P = 101325.0
 
-# ---------- Robust humid-air helpers ----------
+# ---------- robust humid-air helpers ----------
 def humid_air_props(T_K, P_Pa=ATM_P, RH=None, W=None):
-    """
-    Return humid-air properties at (T, P) using either RH or humidity ratio W.
-    Keys:
-      T[K], RH[-], W[kg/kg_da], h[J/kg_da], Tdp[K], Twb[K],
-      rho[kg/m3], mu[Pa·s], k[W/m·K], cp[J/kg·K], Pr[-], nu[m2/s], alpha[m2/s]
-    """
     if RH is None and W is None:
         raise ValueError("Provide either RH or W")
-
-    # sanitize moisture input
     if RH is not None:
         RH = float(np.clip(RH, 1e-4, 0.999))
         try:
@@ -86,7 +41,7 @@ def humid_air_props(T_K, P_Pa=ATM_P, RH=None, W=None):
         R_d = 287.042
         rho = P_Pa/(R_d*T_K*(1.0 + 1.6078*W))
 
-    # dynamic viscosity (use 'M'), k, cp
+    # μ, k, cp
     try:
         mu  = HAPropsSI('M','T',T_K,'P',P_Pa,'W',W)
     except Exception:
@@ -117,7 +72,6 @@ def humid_air_props(T_K, P_Pa=ATM_P, RH=None, W=None):
     except Exception:
         Twb = T_K - 5.0
 
-    # derived
     Pr = cp*mu/max(k, 1e-12)
     nu = mu/max(rho, 1e-12)
     alpha = k/max(rho*cp, 1e-12)
@@ -146,25 +100,18 @@ def state_from_DB_WB(Tdb_C, Twb_C, P=ATM_P):
         W = HAPropsSI('W','T',T,'P',P,'R',0.5)
     s = humid_air_props(T, P, W=W); s['T'] = T; return s
 
-# ---------- Process solver (Q̇ on flowing air) ----------
 def final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P=ATM_P):
-    """
-    Return (s2, note, condensate_dict|None).
-    Condensate dict contains: ΔW (g/kg_da), mass flow (g/s, kg/h), volume flow (mL/s, L/h).
-    """
     if abs(Qdot_kW) < 1e-12 or m_dot_air <= 1e-12:
         return s1.copy(), "No change (zero heat or zero mass flow).", None
-
-    h1 = s1['h']; W1 = s1['W']; T1 = s1['T']
-    q_per_kg = (Qdot_kW*1000.0)/m_dot_air  # J/kg_da
+    h1, W1, T1 = s1['h'], s1['W'], s1['T']
+    q_per_kg = (Qdot_kW*1000.0)/m_dot_air
     h2_target = h1 + q_per_kg
 
-    # Dry path (constant W)
     def h_at_T_constW(T): return HAPropsSI('H','T',T,'P',P,'W',W1)
     T_lo = max(173.15, T1 - 100.0); T_hi = min(373.15, T1 + 100.0)
     try:
-        f = lambda T: h_at_T_constW(T) - h2_target
-        T2_dry = root_scalar(f, bracket=[T_lo, T_hi], method='bisect').root
+        T2_dry = root_scalar(lambda T: h_at_T_constW(T) - h2_target,
+                             bracket=[T_lo, T_hi], method='bisect').root
         RH2 = HAPropsSI('R','T',T2_dry,'P',P,'W',W1)
         if RH2 <= 0.999 or q_per_kg >= 0:
             s2 = humid_air_props(T2_dry, P, W=W1); s2['T'] = T2_dry
@@ -172,18 +119,16 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P=ATM_P):
     except Exception:
         pass
 
-    # Saturated (condensation) path
     def h_sat(T):
         Wsat = HAPropsSI('W','T',T,'P',P,'R',0.999)
         return HAPropsSI('H','T',T,'P',P,'W',Wsat)
     try:
-        g = lambda T: h_sat(T) - h2_target
-        T2 = root_scalar(g, bracket=[max(173.15, T1-80.0), T1], method='bisect').root
+        T2 = root_scalar(lambda T: h_sat(T) - h2_target,
+                         bracket=[max(173.15, T1-80.0), T1], method='bisect').root
         W2 = HAPropsSI('W','T',T2,'P',P,'R',0.999)
         s2 = humid_air_props(T2, P, W=W2); s2['T'] = T2
-
-        dW = max(0.0, W1 - W2)                # kg/kg_da
-        mdot_cond_kg_s = dW * m_dot_air       # kg/s
+        dW = max(0.0, W1 - W2)
+        mdot_cond_kg_s = dW * m_dot_air
         condensate = {
             'dW_g_per_kg': 1000.0*dW,
             'mdot_g_s': 1000.0*mdot_cond_kg_s,
@@ -193,10 +138,11 @@ def final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P=ATM_P):
         }
         return s2, "Cooling with condensation (final state saturated).", condensate
     except Exception as e:
-        s2 = humid_air_props(np.clip(T1 + q_per_kg/max(s1['cp'],1e-9), T_lo, T_hi), P, W=W1)
+        T2_guess = np.clip(T1 + q_per_kg/max(s1['cp'],1e-9), T_lo, T_hi)
+        s2 = humid_air_props(T2_guess, P, W=W1); s2['T'] = T2_guess
         return s2, f"Dry fallback — check inputs. ({e})", None
 
-# ---------- Pretty printers ----------
+# ---------- pretty printing ----------
 def named_block(label, items):
     st.markdown(f"### {label}")
     for name, value, unit in items:
@@ -227,68 +173,65 @@ def state_blocks(title, s, m_dot_air=None):
         ("Kinematic viscosity (ν)", f"{s['nu']:.7e}", "m²/s"),
         ("Thermal diffusivity (α)", f"{s['alpha']:.7e}", "m²/s"),
     ]
-
     st.subheader(title)
     named_block("Psychrometric state", items_main)
     named_block("Transport & derived properties", items_props)
-
     if m_dot_air and m_dot_air > 0:
         water_g_s = s['W']*m_dot_air*1000.0
         named_block("Water content in the stream", [("Water mass flow (ṁ_w)", f"{water_g_s:.2f}", "g/s")])
 
-# ---------- Streamlit UI ----------
-st.title("Moist Air Calculator (named outputs, water content, condensate)")
+# ---------- UI (FORM so typing + Enter works) ----------
+st.title("Moist Air Calculator (form inputs ⏎ to update)")
 
-with st.expander("App diagnostics", expanded=False):
-    st.write({
-        "CoolProp": COOLPROP_VER,
-        "Python": sys.version.split()[0],
-        "Platform": platform.platform()
-    })
-
-with st.sidebar:
+with st.sidebar.form("inputs_form", clear_on_submit=False):
     st.header("Inputs")
-    P_mode = st.selectbox("Pressure mode", ["Sea level (101325 Pa)", "Custom (Pa)"], index=0)
-    P = st.number_input("Pressure (Pa)", min_value=50000, max_value=120000, value=101325, step=500) if P_mode.startswith("Custom") else ATM_P
+    P_mode = st.selectbox("Pressure mode", ["Sea level (101325 Pa)", "Custom (Pa)"], index=0, key="k_press_mode")
+    P = st.number_input("Pressure (Pa)", min_value=50000, max_value=120000, value=101325, step=500,
+                        key="k_press_val") if P_mode.startswith("Custom") else ATM_P
 
-    mode = st.radio("Moisture input mode", ["DB + RH", "DB + WB"], index=0)
-    Tdb_C = st.number_input("Dry-bulb (°C)", min_value=-60.0, max_value=120.0, value=30.0, step=0.5)
+    mode = st.radio("Moisture input mode", ["DB + RH", "DB + WB"], index=0, key="k_mode")
+    Tdb_C = st.number_input("Dry-bulb (°C)", min_value=-60.0, max_value=120.0, value=30.0, step=0.5, key="k_tdb")
     if mode == "DB + RH":
-        RH_pct = st.number_input("Relative Humidity (%)", min_value=1.0, max_value=99.0, value=50.0, step=0.5)
-        s1 = state_from_DB_RH(Tdb_C, RH_pct, P)
+        RH_pct = st.number_input("Relative Humidity (%)", min_value=1.0, max_value=99.0, value=50.0, step=0.5, key="k_rh")
+        Twb_C = None
     else:
-        Twb_C = st.number_input("Wet-bulb (°C)", min_value=-60.0, max_value=120.0, value=20.0, step=0.5)
-        if Twb_C > Tdb_C:
-            st.warning("Wet-bulb cannot exceed dry-bulb; clamped.")
-            Twb_C = Tdb_C
-        s1 = state_from_DB_WB(Tdb_C, Twb_C, P)
+        Twb_C = st.number_input("Wet-bulb (°C)", min_value=-60.0, max_value=120.0, value=20.0, step=0.5, key="k_twb")
+        RH_pct = None
 
     st.header("Process (Q̇ on flowing air)")
-    m_dot_air = st.number_input("Air mass flow ṁ_air (kg/s, dry air basis)", min_value=0.0, max_value=500.0, value=1.0, step=0.1)
-    Qdot_kW   = st.number_input("Heat rate Q̇ (kW)  (+heating / −cooling)", min_value=-10000.0, max_value=10000.0, value=-5.0, step=0.5)
+    m_dot_air = st.number_input("Air mass flow ṁ_air (kg/s, dry air basis)", min_value=0.0, max_value=500.0,
+                                value=1.0, step=0.1, key="k_mdot")
+    Qdot_kW   = st.number_input("Heat rate Q̇ (kW)  (+heating / −cooling)", min_value=-10000.0, max_value=10000.0,
+                                value=-5.0, step=0.5, key="k_qdot")
 
-# Render blocks with compute guards
-try:
-    col1, col2 = st.columns(2)
-    with col1:
-        state_blocks("Initial State", s1, m_dot_air=m_dot_air)
-    with col2:
-        s2, note, condensate = final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P)
-        state_blocks("Final State (after Q̇)", s2, m_dot_air=m_dot_air)
-        st.info(note)
-        if condensate is not None:
-            st.markdown("### Condensate removed (due to cooling)")
-            entries = [
-                ("Water removed per kg dry air (ΔW)", f"{condensate['dW_g_per_kg']:.2f}", "g/kg dry air"),
-                ("Condensate mass flow", f"{condensate['mdot_g_s']:.2f}", "g/s"),
-                ("Condensate mass flow", f"{condensate['mdot_kg_h']:.3f}", "kg/h"),
-                ("Condensate volume flow (≈ water)", f"{condensate['vol_mL_s']:.1f}", "mL/s"),
-                ("Condensate volume flow (≈ water)", f"{condensate['vol_L_h']:.3f}", "L/h"),
-            ]
-            for name, value, unit in entries:
-                st.write(f"**{name}**: {value} {unit}")
-except Exception as e:
-    st.error("A runtime error occurred while computing results.")
-    st.exception(e)
+    submitted = st.form_submit_button("Update / Calculate", use_container_width=True)
 
-st.caption("Notes: h is per kg of dry air. Water volume assumes 1 kg ≈ 1 L. If RH would exceed 100% under cooling, the solver switches to a saturated final state and reports condensate.")
+# ---- compute using current (form) values ----
+# Clamp WB after submission to avoid mid-edit reruns interfering with typing
+if Twb_C is not None and Twb_C > Tdb_C:
+    Twb_C = Tdb_C
+
+s1 = state_from_DB_RH(Tdb_C, RH_pct, P) if RH_pct is not None else state_from_DB_WB(Tdb_C, Twb_C, P)
+s2, note, condensate = final_state_after_Qdot(s1, Qdot_kW, m_dot_air, P)
+
+col1, col2 = st.columns(2)
+with col1:
+    state_blocks("Initial State", s1, m_dot_air=m_dot_air)
+with col2:
+    state_blocks("Final State (after Q̇)", s2, m_dot_air=m_dot_air)
+    st.info(note)
+    if condensate is not None:
+        st.markdown("### Condensate removed (due to cooling)")
+        for name, value, unit in [
+            ("Water removed per kg dry air (ΔW)", f"{condensate['dW_g_per_kg']:.2f}", "g/kg dry air"),
+            ("Condensate mass flow", f"{condensate['mdot_g_s']:.2f}", "g/s"),
+            ("Condensate mass flow", f"{condensate['mdot_kg_h']:.3f}", "kg/h"),
+            ("Condensate volume flow (≈ water)", f"{condensate['vol_mL_s']:.1f}", "mL/s"),
+            ("Condensate volume flow (≈ water)", f"{condensate['vol_L_h']:.3f}", "L/h"),
+        ]:
+            st.write(f"**{name}**: {value} {unit}")
+
+with st.expander("App diagnostics", expanded=False):
+    st.write({"Python": sys.version.split()[0], "Platform": platform.platform()})
+
+st.caption("Tip: click a field, type a new number, then press Enter (or the button) to apply. Using a form prevents mid-typing reruns.")
