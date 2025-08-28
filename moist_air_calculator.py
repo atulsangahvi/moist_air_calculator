@@ -1,11 +1,11 @@
-# Moist Air Calculator — HVAC Volumetric Flow (m³/s) + Dual Enthalpy + PDF Export
-# - Input: DB + (RH or WB), Pressure, Volumetric flow at inlet (m³/s), Heat rate Q̇ (kW)
-# - Output: Psychrometrics, transport props, enthalpy (per kg_dry & per kg_moist),
-#           enthalpy flow at each state (kW), process capacity (kW), condensate if any,
-#           implied outlet volumetric flow.
-# - PDF: customizable title, logo, notes, and section order.
+# Moist Air Calculator — HVAC Volumetric Flow (m³/s) + Dual Enthalpy + Unicode-Safe PDF
+# - Inputs: DB + (RH or WB), Pressure, Volumetric flow V̇_in (m³/s), External heat rate Q̇ (kW)
+# - Outputs: Psychrometrics, transport props, enthalpy (per kg_dry & per kg_moist),
+#            enthalpy flow at each state (kW), process capacity (kW), condensate if any,
+#            implied outlet volumetric flow.
+# - PDF: Upload a Unicode TTF (e.g., DejaVuSans.ttf). If not provided, text is sanitized to ASCII to avoid Unicode errors.
 
-import sys, platform
+import sys, platform, tempfile
 from io import BytesIO
 import streamlit as st
 import numpy as np
@@ -47,7 +47,7 @@ def humid_air_props(T_K, P_Pa=ATM_P, RH=None, W=None):
     if RH is None and W is None:
         raise ValueError("Provide either RH or W")
 
-    # sanitize moisture input
+    # moisture input
     if RH is not None:
         RH = float(np.clip(RH, 1e-4, 0.999))
         try:
@@ -225,7 +225,6 @@ def state_table(title, s, Vdot_in=None, m_dry=None, show_flows=True, show_outlet
         st.write(f"**Water mass flow in stream (ṁ_w = W·ṁ_dry):** {water_g_s:.2f} g/s")
 
     if show_outlet_vol and m_dry is not None:
-        # implied outlet volumetric flow corresponding to THIS state's density
         Vdot_state = (1.0 + s['W']) * m_dry / max(s['rho'], 1e-12)
         st.write(f"**Implied volumetric flow at this state:** {Vdot_state:.3f} m³/s")
 
@@ -234,83 +233,118 @@ def process_capacity_block(s1, s2, m_dot_dry):
     q_kW = m_dot_dry * (h2 - h1) / 1000.0  # kW
     st.markdown("### Process capacity from enthalpy change")
     st.write(f"**Total capacity (Q̇ = ṁ₍da₎·Δh):** {q_kW:.3f} kW")
-    # Enthalpy flow at each state (they are equal whether you use moist or dry basis)
-    hdry1, hmoist1 = enthalpy_dual(s1)
-    hdry2, hmoist2 = enthalpy_dual(s2)
-    Hdot1 = m_dot_dry * hdry1 / 1.0  # kW per (kJ/s) since kJ/kg * kg/s = kJ/s
-    Hdot2 = m_dot_dry * hdry2 / 1.0
+    hdry1, _ = enthalpy_dual(s1)
+    hdry2, _ = enthalpy_dual(s2)
+    Hdot1 = m_dot_dry * hdry1  # kW (kJ/s)
+    Hdot2 = m_dot_dry * hdry2
     st.write(f"**Enthalpy flow at inlet:** {Hdot1:.3f} kW  (per kg₍da₎ basis)")
     st.write(f"**Enthalpy flow at outlet:** {Hdot2:.3f} kW  (per kg₍da₎ basis)")
     return q_kW
 
-# -------------------- PDF builder --------------------
-def build_pdf(data):
+# -------------------- PDF builder (Unicode-aware) --------------------
+def _latin1_sanitize(s: str) -> str:
+    repl = {
+        "ρ":"rho", "μ":"mu", "ν":"nu", "α":"alpha",
+        "₍":"(", "₎":")", "₋":"-", "–":"-", "—":"-",
+        "≈":"~", "’":"'","“":'"',"”":'"',
+        "₍da₎":"(da)", "₍moist₎":"(moist)",
+    }
+    for k,v in repl.items():
+        s = s.replace(k, v)
+    try:
+        s.encode("latin-1")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("latin-1", "ignore").decode("latin-1")
+
+def _kv_to_printable(d: dict, latin1_mode: bool) -> dict:
+    out = {}
+    for k, v in d.items():
+        ks = str(k); vs = str(v)
+        if latin1_mode:
+            ks = _latin1_sanitize(ks)
+            vs = _latin1_sanitize(vs)
+        out[ks] = vs
+    return out
+
+def build_pdf(data, font_path: str | None = None):
     """
-    data: dict with keys:
-      title, logo_bytes|None, notes_text,
-      sections (ordered list of strings),
-      inputs (dict of label->value),
-      inlet (dict of label->value),
-      outlet (dict of label->value),
-      flows (dict),
-      capacity (dict),
-      condensate (dict or None)
+    data keys: title, logo_bytes|None, notes_text, sections (list),
+               inputs, inlet, outlet, flows, capacity, condensate
+    font_path: optional path to a Unicode TTF (e.g., DejaVuSans.ttf)
     """
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, data.get("title","Moist Air Report"), 0, 1, "C")
 
-    # logo (optional)
+    latin1_mode = font_path is None
+
+    # Font setup
+    if not latin1_mode:
+        try:
+            pdf.add_font("UNI", "", font_path, uni=True)
+            pdf.set_font("UNI", "", 16)
+        except Exception:
+            latin1_mode = True
+    if latin1_mode:
+        pdf.set_font("Arial", "B", 16)
+
+    # Title
+    title = data.get("title", "Moist Air Report")
+    if latin1_mode: title = _latin1_sanitize(title)
+    pdf.cell(0, 10, title, 0, 1, "C")
+
+    # Optional logo
     if data.get("logo_bytes"):
         try:
-            # top-right corner
-            pdf.image(data["logo_bytes"], x=170, y=10, w=25)
+            tmp_logo = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            raw = data["logo_bytes"].getvalue() if isinstance(data["logo_bytes"], BytesIO) else data["logo_bytes"]
+            tmp_logo.write(raw); tmp_logo.flush()
+            pdf.image(tmp_logo.name, x=170, y=10, w=25)
         except Exception:
             pass
 
     def section_header(txt):
-        pdf.set_font("Arial", "B", 12)
+        if latin1_mode:
+            txt = _latin1_sanitize(txt); pdf.set_font("Arial", "B", 12)
+        else:
+            pdf.set_font("UNI", "", 12)
         pdf.ln(2); pdf.cell(0, 8, txt, 0, 1)
 
     def kv_table(d):
-        pdf.set_font("Arial", "", 10)
+        d = _kv_to_printable(d, latin1_mode)
+        if latin1_mode: pdf.set_font("Arial", "", 10)
+        else:           pdf.set_font("UNI", "", 10)
         for k, v in d.items():
-            pdf.cell(90, 6, f"{k}:", 0, 0)
+            pdf.cell(85, 6, f"{k}:", 0, 0)
             pdf.cell(0, 6, f"{v}", 0, 1)
 
-    # render selected sections in chosen order
+    # Sections in chosen order
     for sec in data.get("sections", []):
         if sec == "Inputs":
-            section_header("Inputs")
-            kv_table(data.get("inputs", {}))
+            section_header("Inputs"); kv_table(data.get("inputs", {}))
         elif sec == "Inlet state":
-            section_header("Inlet state")
-            kv_table(data.get("inlet", {}))
+            section_header("Inlet state"); kv_table(data.get("inlet", {}))
         elif sec == "Outlet state":
-            section_header("Outlet state")
-            kv_table(data.get("outlet", {}))
+            section_header("Outlet state"); kv_table(data.get("outlet", {}))
         elif sec == "Flows & rates":
-            section_header("Flows & rates")
-            kv_table(data.get("flows", {}))
-            kv_table(data.get("capacity", {}))
+            section_header("Flows & rates"); kv_table(data.get("flows", {})); kv_table(data.get("capacity", {}))
         elif sec == "Condensate":
             if data.get("condensate"):
-                section_header("Condensate")
-                kv_table(data.get("condensate", {}))
+                section_header("Condensate"); kv_table(data.get("condensate", {}))
         elif sec == "Notes":
             notes = data.get("notes_text","").strip()
             if notes:
                 section_header("Notes")
-                pdf.set_font("Arial", "", 10)
-                # simple wrapped text
-                for line in notes.splitlines():
+                txt = _latin1_sanitize(notes) if latin1_mode else notes
+                if latin1_mode: pdf.set_font("Arial", "", 10)
+                else:           pdf.set_font("UNI", "", 10)
+                for line in txt.splitlines():
                     pdf.multi_cell(0, 6, line)
 
-    bio = BytesIO()
-    pdf.output(bio)
-    return bio.getvalue()
+    # Return bytes (handle fpdf2 variations)
+    out = pdf.output(dest="S")
+    return out if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
 
 # -------------------- UI --------------------
 st.title("Moist Air Calculator — HVAC Volumetric Flow (m³/s) + PDF")
@@ -338,12 +372,13 @@ with st.sidebar.form("inputs_form", clear_on_submit=False):
     st.header("PDF options")
     report_title = st.text_input("Report title", value="Moist Air Report")
     logo_file = st.file_uploader("Logo (PNG/JPG)", type=["png","jpg","jpeg"])
-    notes_text = st.text_area("Notes (optional)", height=120, placeholder="Type any comments, headings, or bullet points here...")
+    notes_text = st.text_area("Notes (optional)", height=120, placeholder="Type comments/headings here...")
     sections = st.multiselect(
         "Select sections (click in your desired order)",
         ["Inputs","Inlet state","Outlet state","Flows & rates","Condensate","Notes"],
         default=["Inputs","Inlet state","Outlet state","Flows & rates","Condensate","Notes"],
     )
+    font_file = st.file_uploader("Custom PDF font (TTF/OTF) — e.g., DejaVuSans.ttf / NotoSans-Regular.ttf", type=["ttf","otf"])
 
     submitted = st.form_submit_button("Update / Calculate", use_container_width=True)
 
@@ -396,7 +431,7 @@ s1 = state_from_DB_RH(Tdb_C, RH_pct, P) if RH_pct is not None else state_from_DB
 # Convert HVAC volumetric flow -> mass flows (inlet basis)
 rho1 = s1['rho']; W1 = s1['W']
 m_dot_moist_in = rho1 * Vdot_m3s                # kg moist air / s
-m_dot_dry       = m_dot_moist_in / (1.0 + W1)   # kg dry air / s  (used for balances)
+m_dot_dry       = m_dot_moist_in / (1.0 + W1)   # kg dry air / s (used for balances)
 
 # ---- solve outlet state ----
 s2, note, condensate = final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P)
@@ -428,8 +463,9 @@ with st.expander("App diagnostics", expanded=False):
               "Platform": platform.platform()})
 
 # ---- Build PDF dicts ----
-h1_dry, h1_moist = enthalpy_dual(s1)
-h2_dry, h2_moist = enthalpy_dual(s2)
+def enthalpy_pair(s):
+    a,b = enthalpy_dual(s); return f"{a:.3f} kJ/kg₍da₎ | {b:.3f} kJ/kg₍moist₎"
+
 inputs_dict = {
     "Pressure": f"{P:.0f} Pa",
     "Mode": "DB + RH" if RH_pct is not None else "DB + WB",
@@ -443,16 +479,14 @@ inlet_dict = {
     "DB / WB / DP (°C)": f"{s1['T']-273.15:.2f} / {s1['Twb']-273.15:.2f} / {s1['Tdp']-273.15:.2f}",
     "RH (%)": f"{s1['RH']*100:.2f}",
     "W (g/kg₍da₎)": f"{s1['W']*1000.0:.3f}",
-    "h per kg dry (kJ/kg₍da₎)": f"{h1_dry:.3f}",
-    "h per kg moist (kJ/kg₍moist₎)": f"{h1_moist:.3f}",
+    "Enthalpy (dry | moist)": enthalpy_pair(s1),
     "ρ (kg/m³)": f"{s1['rho']:.4f}",
 }
 outlet_dict = {
     "DB / WB / DP (°C)": f"{s2['T']-273.15:.2f} / {s2['Twb']-273.15:.2f} / {s2['Tdp']-273.15:.2f}",
     "RH (%)": f"{s2['RH']*100:.2f}",
     "W (g/kg₍da₎)": f"{s2['W']*1000.0:.3f}",
-    "h per kg dry (kJ/kg₍da₎)": f"{h2_dry:.3f}",
-    "h per kg moist (kJ/kg₍moist₎)": f"{h2_moist:.3f}",
+    "Enthalpy (dry | moist)": enthalpy_pair(s2),
     "ρ (kg/m³)": f"{s2['rho']:.4f}",
 }
 flows_dict = {
@@ -461,10 +495,11 @@ flows_dict = {
     "V̇_in (m³/s)": f"{Vdot_m3s:.3f}",
     "V̇_out implied (m³/s)": f"{Vdot_out:.3f}",
 }
+hdry1,_ = enthalpy_dual(s1); hdry2,_ = enthalpy_dual(s2)
 capacity_dict = {
     "Q̇ from Δh (kW)": f"{q_kW:.3f}",
-    "Ḣ_in (kW)": f"{(m_dot_dry*h1_dry):.3f}",
-    "Ḣ_out (kW)": f"{(m_dot_dry*h2_dry):.3f}",
+    "Ḣ_in (kW)": f"{(m_dot_dry*hdry1):.3f}",
+    "Ḣ_out (kW)": f"{(m_dot_dry*hdry2):.3f}",
 }
 cond_dict = None
 if condensate is not None:
@@ -476,7 +511,17 @@ if condensate is not None:
         "V̇_cond (L/h)": f"{condensate['vol_L_h']:.3f}",
     }
 
-# ---- PDF download ----
+# Prepare optional font path (saved to a temp file if uploaded)
+font_path = None
+if font_file is not None:
+    try:
+        tmp_font = tempfile.NamedTemporaryFile(delete=False, suffix=".ttf")
+        tmp_font.write(font_file.read()); tmp_font.flush()
+        font_path = tmp_font.name
+    except Exception:
+        font_path = None
+
+# Pass logo bytes (raw) to build_pdf
 logo_bytes = None
 if logo_file is not None:
     try:
@@ -495,11 +540,14 @@ pdf_bytes = build_pdf({
     "flows": flows_dict,
     "capacity": capacity_dict,
     "condensate": cond_dict,
-})
-st.download_button("📄 Download PDF report", data=pdf_bytes, file_name="moist_air_report.pdf",
-                   mime="application/pdf", use_container_width=True)
+}, font_path=font_path)
+
+st.download_button("📄 Download PDF report", data=pdf_bytes,
+                   file_name="moist_air_report.pdf", mime="application/pdf",
+                   use_container_width=True)
 
 st.caption(
     "Enthalpy is reported per kg of dry air (psychrometric standard) and per kg of moist air. "
-    "Enthalpy flow Ḣ = ṁ₍da₎·h; capacity Q̇ from Δh uses the inlet-based ṁ₍da₎ derived from your m³/s input."
+    "Ḣ = ṁ₍da₎·h; capacity Q̇ from Δh uses the inlet-based ṁ₍da₎ derived from your m³/s input. "
+    "Upload a Unicode TTF for full symbol support in the PDF."
 )
