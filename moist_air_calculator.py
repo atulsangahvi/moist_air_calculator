@@ -290,7 +290,7 @@ def _kv_to_printable(d: dict, latin1_mode: bool) -> dict:
         ks = str(k); vs = str(v)
         if latin1_mode:
             ks = _latin1_sanitize(ks)
-            vs = _latin1_sanitize(vs)
+            vs = _latin1_sanitize(v)
         out[ks] = vs
     return out
 
@@ -370,15 +370,19 @@ def build_pdf(data, font_path: str | None = None):
 # -------------------- UI --------------------
 st.title("Moist Air Calculator — HVAC Volumetric Flow (m³/s) + PDF")
 
+# --- Minimal fix: move the moisture mode toggle OUTSIDE the form so it reruns immediately ---
+mode = st.sidebar.radio("Moisture input mode", ["DB + RH", "DB + WB"], index=0, key="mode_radio")
+
 with st.sidebar.form("inputs_form", clear_on_submit=False):
     st.header("Inputs")
 
     P_mode = st.selectbox("Pressure mode", ["Sea level (101325 Pa)", "Custom (Pa)"], index=0)
     P_txt  = text_num("Pressure (Pa)", "txt_P", "101325", help="Used if 'Custom' is selected.")
 
-    mode = st.radio("Moisture input mode", ["DB + RH", "DB + WB"], index=0)
     Tdb_txt = text_num("Dry-bulb (°C)", "txt_Tdb", "30.0")
 
+    # Read the current mode from session_state so the form body reflects the outside toggle
+    mode = st.session_state.get("mode_radio", "DB + RH")
     if mode == "DB + RH":
         RH_txt  = text_num("Relative Humidity (%)", "txt_RH", "50.0")
         Twb_txt = None
