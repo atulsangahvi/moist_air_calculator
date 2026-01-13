@@ -10,6 +10,32 @@ import numpy as np
 from CoolProp.CoolProp import HAPropsSI
 from fpdf import FPDF
 
+import streamlit as st
+import hmac
+
+def password_gate():
+    """Simple shared-password gate for public Streamlit apps."""
+    if "auth_ok" not in st.session_state:
+        st.session_state.auth_ok = False
+
+    def _check():
+        entered = st.session_state.get("password_input", "")
+        secret = st.secrets.get("APP_PASSWORD", "")
+        st.session_state.auth_ok = hmac.compare_digest(entered, secret)
+
+    if not st.session_state.auth_ok:
+        st.markdown("### 🔒 Access restricted")
+        st.text_input(
+            "Enter password",
+            type="password",
+            key="password_input",
+            on_change=_check
+        )
+        st.info("This tool is restricted. Please enter the password.")
+        st.stop()
+
+password_gate()
+
 st.set_page_config(page_title="Moist Air Calculator (HVAC volumetric + PDF)", layout="wide")
 ATM_P = 101325.0
 
