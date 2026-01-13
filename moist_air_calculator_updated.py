@@ -142,7 +142,7 @@ def humid_air_props(T_K, P_Pa=ATM_P, RH=None, W=None):
 def state_from_DB_RH(Tdb_C, RH_pct, P=ATM_P):
     T = Tdb_C + 273.15
     RH = float(np.clip(RH_pct/100.0, 1e-4, 0.999))
-    s = humid_air_props(T, P, RH=RH); s['T'] = T; return s
+    s = humid_air_props(T, P, RH=RH); s['T'] = T; s['P'] = P; return s
 
 def state_from_DB_WB(Tdb_C, Twb_C, P=ATM_P):
     T = Tdb_C + 273.15
@@ -158,7 +158,7 @@ def state_from_DB_WB(Tdb_C, Twb_C, P=ATM_P):
         W = bisect_solve(fW, W_lo, W_hi, tol=1e-8)
     except Exception:
         W = HAPropsSI('W','T',T,'P',P,'R',0.5)
-    s = humid_air_props(T, P, W=W); s['T'] = T; return s
+    s = humid_air_props(T, P, W=W); s['T'] = T; s['P'] = P; return s
 
 # ---------- Process solver (Q̇ on flowing air) ----------
 
