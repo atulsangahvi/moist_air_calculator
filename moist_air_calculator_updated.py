@@ -160,6 +160,69 @@ def state_from_DB_WB(Tdb_C, Twb_C, P=ATM_P):
         W = HAPropsSI('W','T',T,'P',P,'R',0.5)
     s = humid_air_props(T, P, W=W); s['T'] = T; s['P'] = P; return s
 
+
+
+def mix_air_streams(streams, P=ATM_P):
+    """Mix humid-air streams adiabatically on a dry-air basis.
+
+    Each stream is a dict with keys: state, Vdot_m3s, name.
+    Returns mixed state, total dry/moist mass flows, and component flow details.
+    """
+    if not streams:
+        raise ValueError("At least one air stream is required.")
+
+    details = []
+    mda_total = 0.0
+    mma_total = 0.0
+    water_total = 0.0
+    H_total = 0.0
+
+    for item in streams:
+        s = item["state"]
+        V = float(item["Vdot_m3s"])
+        if V < 0:
+            raise ValueError("Volumetric flow cannot be negative.")
+        m_moist = s["rho"] * V
+        m_da = m_moist / (1.0 + s["W"])
+        m_w = m_da * s["W"]
+        Hdot = m_da * s["h"]
+        mda_total += m_da
+        mma_total += m_moist
+        water_total += m_w
+        H_total += Hdot
+        details.append({
+            "name": item.get("name", "Stream"), "Vdot_m3s": V,
+            "m_dot_moist": m_moist, "m_dot_dry": m_da,
+            "m_dot_water": m_w, "Hdot_W": Hdot, "state": s,
+        })
+
+    if mda_total <= 1e-12:
+        raise ValueError("Total dry-air mass flow must be greater than zero.")
+
+    W_mix = water_total / mda_total
+    h_mix = H_total / mda_total
+
+    def fT(T):
+        return HAPropsSI('H', 'T', T, 'P', P, 'W', W_mix) - h_mix
+
+    Tmin = min(d["state"]["T"] for d in details) - 30.0
+    Tmax = max(d["state"]["T"] for d in details) + 30.0
+    T_mix = bisect_solve(fT, max(173.15, Tmin), min(373.15, Tmax), tol=1e-8)
+    s_mix = humid_air_props(T_mix, P, W=W_mix)
+    s_mix["T"] = T_mix
+    s_mix["P"] = P
+    V_mix = (1.0 + W_mix) * mda_total / max(s_mix["rho"], 1e-12)
+
+    return {
+        "state": s_mix,
+        "m_dot_dry": mda_total,
+        "m_dot_moist": mma_total,
+        "m_dot_water": water_total,
+        "Hdot_W": H_total,
+        "Vdot_m3s": V_mix,
+        "details": details,
+    }
+
 # ---------- Process solver (Q̇ on flowing air) ----------
 
 # ---------- Coil capacity from inlet/outlet DB+WB ----------
@@ -395,6 +458,12 @@ def build_pdf(data, font_path: str | None = None):
     for sec in data.get("sections", []):
         if sec == "Inputs":
             section_header("Inputs"); kv_table(data.get("inputs", {}))
+        elif sec == "Return air":
+            section_header("Return air"); kv_table(data.get("return_air", {}))
+        elif sec == "Fresh air":
+            section_header("Fresh air"); kv_table(data.get("fresh_air", {}))
+        elif sec == "Mixed air":
+            section_header("Mixed air entering coil"); kv_table(data.get("mixed_air", {}))
         elif sec == "Inlet state":
             section_header("Inlet state"); kv_table(data.get("inlet", {}))
         elif sec == "Outlet state":
@@ -418,320 +487,261 @@ def build_pdf(data, font_path: str | None = None):
     return out if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
 
 # -------------------- UI --------------------
-st.title("Moist Air Calculator — HVAC Volumetric Flow (m³/s) + PDF")
-
-# --- Minimal fix: move the moisture mode toggle OUTSIDE the form so it reruns immediately ---
-mode = st.sidebar.radio("Moisture input mode", ["DB + RH", "DB + WB"], index=0, key="mode_radio")
+st.title("Moist Air Calculator — Mixed Air + Heating/Cooling Process")
+st.caption("Mix return air and fresh air, then apply a direct heat rate to the mixed stream. Use negative kW for cooling and positive kW for heating.")
 
 calc_mode = st.sidebar.radio(
     "Calculator",
-    ["Process Q̇ (existing)", "Coil capacity from In/Out DB+WB"],
+    ["Mixed-air process Q̇", "Single-stream process Q̇", "Coil capacity from In/Out DB+WB"],
     index=0,
     key="calc_mode_radio"
 )
 
+# Moisture-mode selectors stay outside the form so the form updates immediately.
+if calc_mode == "Mixed-air process Q̇":
+    st.sidebar.markdown("### Return air")
+    ra_mode = st.sidebar.radio("Return-air moisture input", ["DB + RH", "DB + WB"], key="ra_mode")
+    st.sidebar.markdown("### Fresh air")
+    fa_mode = st.sidebar.radio("Fresh-air moisture input", ["DB + RH", "DB + WB"], key="fa_mode")
+elif calc_mode == "Single-stream process Q̇":
+    single_mode = st.sidebar.radio("Moisture input mode", ["DB + RH", "DB + WB"], key="single_mode")
 
 with st.sidebar.form("inputs_form", clear_on_submit=False):
-    st.header("Inputs")
-
+    st.header("General")
     P_mode = st.selectbox("Pressure mode", ["Sea level (101325 Pa)", "Custom (Pa)"], index=0)
-    P_txt  = text_num("Pressure (Pa)", "txt_P", "101325", help="Used if 'Custom' is selected.")
+    P_txt = text_num("Pressure (Pa)", "txt_P", "101325")
 
-    Tdb_txt = text_num("Dry-bulb (°C)", "txt_Tdb", "30.0")
+    if calc_mode == "Mixed-air process Q̇":
+        st.header("Return air stream")
+        ra_Tdb_txt = text_num("Return air DB (°C)", "ra_Tdb", "26.0")
+        if st.session_state.get("ra_mode", "DB + RH") == "DB + RH":
+            ra_RH_txt = text_num("Return air RH (%)", "ra_RH", "50.0"); ra_Twb_txt = None
+        else:
+            ra_Twb_txt = text_num("Return air WB (°C)", "ra_Twb", "19.0"); ra_RH_txt = None
+        ra_flow_txt = text_num("Return airflow", "ra_flow", "6000")
+        ra_units = st.selectbox("Return airflow units", ["m³/h", "m³/s"], key="ra_units")
 
-    # Read the current mode from session_state so the form body reflects the outside toggle
-    mode = st.session_state.get("mode_radio", "DB + RH")
-    if mode == "DB + RH":
-        RH_txt  = text_num("Relative Humidity (%)", "txt_RH", "50.0")
-        Twb_txt = None
-    else:
-        Twb_txt = text_num("Wet-bulb (°C)", "txt_Twb", "20.0")
-        RH_txt  = None
+        st.header("Fresh air stream")
+        fa_Tdb_txt = text_num("Fresh air DB (°C)", "fa_Tdb", "45.0")
+        if st.session_state.get("fa_mode", "DB + RH") == "DB + RH":
+            fa_RH_txt = text_num("Fresh air RH (%)", "fa_RH", "35.0"); fa_Twb_txt = None
+        else:
+            fa_Twb_txt = text_num("Fresh air WB (°C)", "fa_Twb", "27.0"); fa_RH_txt = None
+        fa_flow_txt = text_num("Fresh airflow", "fa_flow", "2500")
+        fa_units = st.selectbox("Fresh airflow units", ["m³/h", "m³/s"], key="fa_units")
 
-    st.header("Process (Q̇ on flowing air)")
-    Vdot_txt = text_num("Volumetric flow V̇_air (m³/s) — at inlet", "txt_vdot", "1.20")
-    qdot_txt = text_num("External heat rate Q̇ (kW)  (+heating / −cooling)", "txt_qdot", "-5.0")
+        st.header("Coil process")
+        qdot_txt = text_num("External heat rate Q̇ (kW)", "txt_qdot", "-49.6", help="Negative = cooling; positive = heating")
+
+    elif calc_mode == "Single-stream process Q̇":
+        st.header("Air stream")
+        Tdb_txt = text_num("Dry-bulb (°C)", "txt_Tdb", "30.0")
+        if st.session_state.get("single_mode", "DB + RH") == "DB + RH":
+            RH_txt = text_num("Relative Humidity (%)", "txt_RH", "50.0"); Twb_txt = None
+        else:
+            Twb_txt = text_num("Wet-bulb (°C)", "txt_Twb", "20.0"); RH_txt = None
+        Vdot_txt = text_num("Volumetric airflow", "txt_vdot", "1.20")
+        single_units = st.selectbox("Airflow units", ["m³/s", "m³/h"], key="single_units")
+        qdot_txt = text_num("External heat rate Q̇ (kW)", "txt_qdot", "-5.0")
 
     st.header("PDF options")
-    report_title = st.text_input("Report title", value="Moist Air Report")
-    logo_file = st.file_uploader("Logo (PNG/JPG)", type=["png","jpg","jpeg"])
-    notes_text = st.text_area("Notes (optional)", height=120, placeholder="Type comments/headings here...")
+    report_title = st.text_input("Report title", value="Moist Air Report", key="report_title")
+    notes_text = st.text_area("Notes (optional)", height=100, key="notes_text")
+    default_sections = ["Inputs", "Return air", "Fresh air", "Mixed air", "Outlet state", "Flows & rates", "Condensate", "Notes"] if calc_mode == "Mixed-air process Q̇" else ["Inputs", "Inlet state", "Outlet state", "Flows & rates", "Condensate", "Notes"]
     sections = st.multiselect(
-        "Select sections (click in your desired order)",
-        ["Inputs","Inlet state","Outlet state","Flows & rates","Condensate","Notes"],
-        default=["Inputs","Inlet state","Outlet state","Flows & rates","Condensate","Notes"],
+        "PDF sections",
+        ["Inputs", "Return air", "Fresh air", "Mixed air", "Inlet state", "Outlet state", "Flows & rates", "Condensate", "Notes"],
+        default=default_sections,
+        key="sections"
     )
-    font_file = st.file_uploader("Custom PDF font (TTF/OTF) — e.g., DejaVuSans.ttf / NotoSans-Regular.ttf", type=["ttf","otf"])
-
     submitted = st.form_submit_button("Update / Calculate", use_container_width=True)
 
-# ---- parse & validate ----
 errors = []
-
 try:
     P_val = parse_number(P_txt, min_val=50000, max_val=120000, field_name="Pressure")
     P = P_val if P_mode.startswith("Custom") else ATM_P
 except ValueError as e:
     errors.append(str(e)); P = ATM_P
 
-try:
-    Tdb_C = parse_number(Tdb_txt, min_val=-60.0, max_val=120.0, field_name="Dry-bulb")
-except ValueError as e:
-    errors.append(str(e)); Tdb_C = 30.0
-
-RH_pct = None; Twb_C = None
-if mode == "DB + RH":
-    try:
-        RH_pct = parse_number(RH_txt, min_val=1.0, max_val=99.0, field_name="Relative Humidity (%)")
-    except ValueError as e:
-        errors.append(str(e)); RH_pct = 50.0
-else:
-    try:
-        Twb_C = parse_number(Twb_txt, min_val=-60.0, max_val=120.0, field_name="Wet-bulb")
-    except ValueError as e:
-        errors.append(str(e)); Twb_C = 20.0
-    if Twb_C > Tdb_C:
-        errors.append("Wet-bulb cannot exceed Dry-bulb. It will be clamped to DB.")
-        Twb_C = Tdb_C
-
-try:
-    Vdot_m3s = parse_number(Vdot_txt, min_val=0.0, max_val=500.0, field_name="Volumetric flow V̇_air")
-except ValueError as e:
-    errors.append(str(e)); Vdot_m3s = 1.2
-
-try:
-    Qdot_kW = parse_number(qdot_txt, min_val=-10000.0, max_val=10000.0, field_name="Heat rate")
-except ValueError as e:
-    errors.append(str(e)); Qdot_kW = -5.0
-
-if errors:
-    st.error("Please fix these inputs:")
-    for e in errors: st.write("• " + e)
-
-# ---- optional: coil capacity from inlet/outlet DB+WB ----
+# Existing independent coil-capacity calculator
 if calc_mode == "Coil capacity from In/Out DB+WB":
     st.header("Coil capacity from inlet/outlet DB + WB")
-
     c1, c2 = st.columns(2)
     with c1:
-        Tdb_in2  = st.number_input("Inlet DB (°C)", value=24.3, step=0.1, key="cap_tdb_in")
-        Twb_in2  = st.number_input("Inlet WB (°C)", value=18.1, step=0.1, key="cap_twb_in")
+        Tdb_in2 = st.number_input("Inlet DB (°C)", value=24.3, step=0.1)
+        Twb_in2 = st.number_input("Inlet WB (°C)", value=18.1, step=0.1)
     with c2:
-        Tdb_out2 = st.number_input("Outlet DB (°C)", value=13.5, step=0.1, key="cap_tdb_out")
-        Twb_out2 = st.number_input("Outlet WB (°C)", value=12.8, step=0.1, key="cap_twb_out")
-
-    # Airflow input (supports your common m³/h measurement)
-    flow_units = st.radio("Airflow units", ["m³/s", "m³/h"], horizontal=True, index=1, key="cap_flow_units")
-    Vdot_in = st.number_input("Airflow", value=6250.0 if flow_units == "m³/h" else 6250.0/3600.0,
-                              step=10.0 if flow_units == "m³/h" else 0.01, key="cap_flow")
-    Vdot2_m3s = Vdot_in / 3600.0 if flow_units == "m³/h" else Vdot_in
-
-    flow_meas2 = st.selectbox("Airflow measured at", ["outlet", "inlet"], index=0, key="cap_flow_meas")
-
-    # Guardrails
-    if Twb_in2 > Tdb_in2:
-        st.warning("Inlet WB > DB; clamping WB to DB.")
-        Twb_in2 = Tdb_in2
-    if Twb_out2 > Tdb_out2:
-        st.warning("Outlet WB > DB; clamping WB to DB.")
-        Twb_out2 = Tdb_out2
-
-    # Ensure pressure variable exists and is numeric for this mode
-    P_use = float(globals().get('P', ATM_P))
-
+        Tdb_out2 = st.number_input("Outlet DB (°C)", value=13.5, step=0.1)
+        Twb_out2 = st.number_input("Outlet WB (°C)", value=12.8, step=0.1)
+    flow_units = st.radio("Airflow units", ["m³/s", "m³/h"], horizontal=True, index=1)
+    Vdot_in = st.number_input("Airflow", value=6250.0 if flow_units == "m³/h" else 6250.0/3600.0)
+    Vdot2_m3s = Vdot_in/3600.0 if flow_units == "m³/h" else Vdot_in
+    flow_meas2 = st.selectbox("Airflow measured at", ["outlet", "inlet"], index=0)
     try:
-        cap = coil_capacity_from_in_out(
-            Tdb_in2, Twb_in2,
-            Tdb_out2, Twb_out2,
-            Vdot2_m3s,
-            flow_measured_at=flow_meas2,
-            P=P_use
-        )
-
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Sensible (kW)", f"{cap['Q_sens_kW']:.2f}")
-        k2.metric("Latent (kW)", f"{cap['Q_lat_kW']:.2f}")
-        k3.metric("Total (kW)", f"{cap['Q_total_kW']:.2f}")
-
-        a1, a2, a3 = st.columns(3)
-        a1.metric("SHR", f"{cap['SHR']:.3f}")
-        a2.metric("Dry-air ṁ (kg/s)", f"{cap['m_dot_dry']:.3f}")
-        a3.metric("Total (TR)", f"{cap['TR_total']:.2f}")
-
-        with st.expander("State details", expanded=False):
-            st.write({
-                "Pressure used (Pa)": cap["s_in"]["P"],
-                "Inlet W (g/kg_da)": round(1000.0 * cap["s_in"]["W"], 3),
-                "Outlet W (g/kg_da)": round(1000.0 * cap["s_out"]["W"], 3),
-                "Inlet h (kJ/kg_da)": round(cap["s_in"]["h"]/1000.0, 3),
-                "Outlet h (kJ/kg_da)": round(cap["s_out"]["h"]/1000.0, 3),
-                "Inlet rho (kg/m³)": round(cap["s_in"]["rho"], 4),
-                "Outlet rho (kg/m³)": round(cap["s_out"]["rho"], 4),
-            })
-
+        cap = coil_capacity_from_in_out(Tdb_in2, min(Twb_in2,Tdb_in2), Tdb_out2, min(Twb_out2,Tdb_out2), Vdot2_m3s, flow_measured_at=flow_meas2, P=P)
+        a,b,c = st.columns(3)
+        a.metric("Sensible", f"{cap['Q_sens_kW']:.2f} kW")
+        b.metric("Latent", f"{cap['Q_lat_kW']:.2f} kW")
+        c.metric("Total", f"{cap['Q_total_kW']:.2f} kW")
+        a,b,c = st.columns(3)
+        a.metric("SHR", f"{cap['SHR']:.3f}")
+        b.metric("Dry-air flow", f"{cap['m_dot_dry']:.3f} kg/s")
+        c.metric("Total", f"{cap['TR_total']:.2f} TR")
     except Exception as e:
         st.error(f"Capacity calculation failed: {e}")
-
-    # Stop here so the existing Q̇ process section doesn't also run.
     st.stop()
 
-# ---- compute inlet state ----
-s1 = state_from_DB_RH(Tdb_C, RH_pct, P) if RH_pct is not None else state_from_DB_WB(Tdb_C, Twb_C, P)
 
-# Convert HVAC volumetric flow -> mass flows (inlet basis)
-rho1 = s1['rho']; W1 = s1['W']
-m_dot_moist_in = rho1 * Vdot_m3s                # kg moist air / s
-m_dot_dry       = m_dot_moist_in / (1.0 + W1)   # kg dry air / s (used for balances)
+def parse_state(prefix, mode_name, Tdb_text, RH_text, Twb_text):
+    Tdb = parse_number(Tdb_text, min_val=-60, max_val=120, field_name=f"{prefix} DB")
+    if mode_name == "DB + RH":
+        RH = parse_number(RH_text, min_val=0.1, max_val=99.9, field_name=f"{prefix} RH")
+        return state_from_DB_RH(Tdb, RH, P), Tdb, RH, None
+    Twb = parse_number(Twb_text, min_val=-60, max_val=120, field_name=f"{prefix} WB")
+    if Twb > Tdb:
+        raise ValueError(f"{prefix} WB cannot exceed DB.")
+    return state_from_DB_WB(Tdb, Twb, P), Tdb, None, Twb
 
-# ---- solve outlet state ----
+try:
+    Qdot_kW = parse_number(qdot_txt, min_val=-10000, max_val=10000, field_name="Heat rate")
+except ValueError as e:
+    errors.append(str(e)); Qdot_kW = 0.0
+
+return_air = fresh_air = mixed = None
+if calc_mode == "Mixed-air process Q̇":
+    try:
+        s_ra, ra_Tdb, ra_RH, ra_Twb = parse_state("Return air", st.session_state.get("ra_mode","DB + RH"), ra_Tdb_txt, ra_RH_txt, ra_Twb_txt)
+        s_fa, fa_Tdb, fa_RH, fa_Twb = parse_state("Fresh air", st.session_state.get("fa_mode","DB + RH"), fa_Tdb_txt, fa_RH_txt, fa_Twb_txt)
+        ra_flow = parse_number(ra_flow_txt, min_val=0, max_val=2_000_000, field_name="Return airflow")
+        fa_flow = parse_number(fa_flow_txt, min_val=0, max_val=2_000_000, field_name="Fresh airflow")
+        ra_V = ra_flow/3600.0 if ra_units == "m³/h" else ra_flow
+        fa_V = fa_flow/3600.0 if fa_units == "m³/h" else fa_flow
+        mixed = mix_air_streams([
+            {"name":"Return air", "state":s_ra, "Vdot_m3s":ra_V},
+            {"name":"Fresh air", "state":s_fa, "Vdot_m3s":fa_V},
+        ], P)
+        s1 = mixed["state"]
+        m_dot_dry = mixed["m_dot_dry"]
+        Vdot_m3s = mixed["Vdot_m3s"]
+        m_dot_moist_in = (1+s1["W"])*m_dot_dry
+        return_air, fresh_air = s_ra, s_fa
+    except ValueError as e:
+        errors.append(str(e))
+else:
+    try:
+        s1, Tdb_C, RH_pct, Twb_C = parse_state("Air", st.session_state.get("single_mode","DB + RH"), Tdb_txt, RH_txt, Twb_txt)
+        Vraw = parse_number(Vdot_txt, min_val=0, max_val=2_000_000, field_name="Airflow")
+        Vdot_m3s = Vraw/3600.0 if single_units == "m³/h" else Vraw
+        m_dot_moist_in = s1["rho"]*Vdot_m3s
+        m_dot_dry = m_dot_moist_in/(1+s1["W"])
+    except ValueError as e:
+        errors.append(str(e))
+
+if errors:
+    st.error("Please correct the following inputs:")
+    for e in errors: st.write("• " + e)
+    st.stop()
+
 s2, note, condensate = final_state_after_Qdot(s1, Qdot_kW, m_dot_dry, P)
+Vdot_out = (1+s2["W"])*m_dot_dry/max(s2["rho"],1e-12)
 
-# implied outlet volumetric flow (density & W at outlet)
-Vdot_out = (1.0 + s2['W']) * m_dot_dry / max(s2['rho'], 1e-12)
+if calc_mode == "Mixed-air process Q̇":
+    st.markdown("## Air mixing")
+    c1,c2 = st.columns(2)
+    with c1: state_table("Return Air", return_air, Vdot_in=ra_V, m_dry=mixed['details'][0]['m_dot_dry'])
+    with c2: state_table("Fresh Air", fresh_air, Vdot_in=fa_V, m_dry=mixed['details'][1]['m_dot_dry'])
+    st.markdown("## Coil process")
+    c1,c2 = st.columns(2)
+    with c1: state_table("Mixed Air Entering Coil", s1, Vdot_in=Vdot_m3s, m_dry=m_dot_dry)
+    with c2:
+        state_table("Final Air Leaving Coil", s2, m_dry=m_dot_dry, show_flows=False, show_outlet_vol=True)
+        st.info(note)
+else:
+    c1,c2=st.columns(2)
+    with c1: state_table("Initial State", s1, Vdot_in=Vdot_m3s, m_dry=m_dot_dry)
+    with c2:
+        state_table("Final State", s2, m_dry=m_dot_dry, show_flows=False, show_outlet_vol=True)
+        st.info(note)
 
-# ---- display ----
-col1, col2 = st.columns(2)
-with col1:
-    state_table("Initial State", s1, Vdot_in=Vdot_m3s, m_dry=m_dot_dry, show_flows=True, show_outlet_vol=False)
-with col2:
-    state_table("Final State (after Q̇)", s2, Vdot_in=Vdot_m3s, m_dry=m_dot_dry, show_flows=True, show_outlet_vol=True)
-    st.write(f"**Implied outlet volumetric flow (V̇_out):** {Vdot_out:.3f} m³/s")
-    st.info(note)
-
-st.markdown("## Capacity")
+st.markdown("## Process results")
 q_kW = process_capacity_block(s1, s2, m_dot_dry)
+Q_total_cooling = max(0.0, -q_kW)
+if Q_total_cooling > 0:
+    Q_sens = m_dot_dry*s1['cp']*((s1['T']-s2['T']))/1000.0
+    Q_sens = max(0.0, min(Q_total_cooling, Q_sens))
+    Q_lat = Q_total_cooling-Q_sens
+    a,b,c,d=st.columns(4)
+    a.metric("Total cooling", f"{Q_total_cooling:.2f} kW")
+    b.metric("Sensible cooling", f"{Q_sens:.2f} kW")
+    c.metric("Latent cooling", f"{Q_lat:.2f} kW")
+    d.metric("SHR", f"{Q_sens/Q_total_cooling:.3f}")
 
-if condensate is not None:
-    st.markdown("## Condensate (due to cooling)")
-    st.write(f"**Water removed per kg dry air (ΔW):** {condensate['dW_g_per_kg']:.2f} g/kg₍da₎")
-    st.write(f"**Condensate mass flow:** {condensate['mdot_g_s']:.2f} g/s ({condensate['mdot_kg_h']:.3f} kg/h)")
-    st.write(f"**Condensate volume flow (≈ water):** {condensate['vol_mL_s']:.1f} mL/s ({condensate['vol_L_h']:.3f} L/h)")
+if condensate:
+    st.markdown("## Condensate")
+    a,b,c=st.columns(3)
+    a.metric("Moisture removed", f"{condensate['dW_g_per_kg']:.3f} g/kgda")
+    b.metric("Condensate", f"{condensate['mdot_kg_h']:.3f} kg/h")
+    c.metric("Condensate volume", f"{condensate['vol_L_h']:.3f} L/h")
 
-with st.expander("App diagnostics", expanded=False):
-    st.write({"CoolProp": getattr(sys.modules.get('CoolProp'), '__version__', 'unknown'),
-              "Python": sys.version.split()[0],
-              "Platform": platform.platform()})
-
-# ---- Build PDF dicts ----
-def enthalpy_pair(s):
-    a,b = enthalpy_dual(s); return f"{a:.3f} kJ/kg₍da₎ | {b:.3f} kJ/kg₍moist₎"
-
-inputs_dict = {
-    "Pressure": f"{P:.0f} Pa",
-    "Mode": "DB + RH" if RH_pct is not None else "DB + WB",
-    "Dry-bulb (°C)": f"{Tdb_C:.2f}",
-    "Relative Humidity (%)": f"{RH_pct:.2f}" if RH_pct is not None else "—",
-    "Wet-bulb (°C)": f"{Twb_C:.2f}" if Twb_C is not None else "—",
-    "Volumetric flow V̇_in": f"{Vdot_m3s:.3f} m³/s",
-    "External heat rate Q̇": f"{Qdot_kW:.3f} kW",
-}
-inlet_dict = {
-    "DB / WB / DP (°C)": f"{s1['T']-273.15:.2f} / {s1['Twb']-273.15:.2f} / {s1['Tdp']-273.15:.2f}",
-    "RH (%)": f"{s1['RH']*100:.2f}",
-    "W (g/kg₍da₎)": f"{s1['W']*1000.0:.3f}",
-    "Enthalpy (dry | moist)": enthalpy_pair(s1),
-    "ρ (kg/m³)": f"{s1['rho']:.4f}",
-}
-outlet_dict = {
-    "DB / WB / DP (°C)": f"{s2['T']-273.15:.2f} / {s2['Twb']-273.15:.2f} / {s2['Tdp']-273.15:.2f}",
-    "RH (%)": f"{s2['RH']*100:.2f}",
-    "W (g/kg₍da₎)": f"{s2['W']*1000.0:.3f}",
-    "Enthalpy (dry | moist)": enthalpy_pair(s2),
-    "ρ (kg/m³)": f"{s2['rho']:.4f}",
-}
-flows_dict = {
-    "ṁ_moist (kg/s) @ inlet": f"{m_dot_moist_in:.3f}",
-    "ṁ_dry (kg₍da₎/s)": f"{m_dot_dry:.3f}",
-    "V̇_in (m³/s)": f"{Vdot_m3s:.3f}",
-    "V̇_out implied (m³/s)": f"{Vdot_out:.3f}",
-}
-hdry1,_ = enthalpy_dual(s1); hdry2,_ = enthalpy_dual(s2)
-capacity_dict = {
-    "Q̇ from Δh (kW)": f"{q_kW:.3f}",
-    "Ḣ_in (kW)": f"{(m_dot_dry*hdry1):.3f}",
-    "Ḣ_out (kW)": f"{(m_dot_dry*hdry2):.3f}",
-}
-cond_dict = None
-if condensate is not None:
-    cond_dict = {
-        "ΔW (g/kg₍da₎)": f"{condensate['dW_g_per_kg']:.2f}",
-        "ṁ_cond (g/s)": f"{condensate['mdot_g_s']:.2f}",
-        "ṁ_cond (kg/h)": f"{condensate['mdot_kg_h']:.3f}",
-        "V̇_cond (mL/s)": f"{condensate['vol_mL_s']:.1f}",
-        "V̇_cond (L/h)": f"{condensate['vol_L_h']:.3f}",
+# PDF preparation
+def state_dict(s):
+    return {
+        "DB / WB / DP (°C)": f"{s['T']-273.15:.2f} / {s['Twb']-273.15:.2f} / {s['Tdp']-273.15:.2f}",
+        "RH (%)": f"{100*s['RH']:.2f}",
+        "W (g/kg_da)": f"{1000*s['W']:.3f}",
+        "Enthalpy dry | moist": f"{s['h']/1000:.3f} | {s['h']/1000/(1+s['W']):.3f} kJ/kg",
+        "Density (kg/m3)": f"{s['rho']:.4f}",
     }
 
-# Optional font
-font_path = None
-font_file = st.session_state.get("font_file_widget", None)  # just to avoid linter noise
-with st.sidebar:
-    pass
+if calc_mode == "Mixed-air process Q̇":
+    inputs_dict = {
+        "Pressure": f"{P:.0f} Pa", "Process heat rate": f"{Qdot_kW:.3f} kW",
+        "Return airflow": f"{ra_V:.4f} m3/s ({ra_V*3600:.1f} m3/h)",
+        "Fresh airflow": f"{fa_V:.4f} m3/s ({fa_V*3600:.1f} m3/h)",
+        "Mixed airflow": f"{Vdot_m3s:.4f} m3/s ({Vdot_m3s*3600:.1f} m3/h)",
+    }
+else:
+    inputs_dict = {"Pressure":f"{P:.0f} Pa", "Airflow":f"{Vdot_m3s:.4f} m3/s", "Process heat rate":f"{Qdot_kW:.3f} kW"}
 
-# Prepare optional font path (saved to a temp file if uploaded)
-logo_bytes = None
-st.markdown("## PDF")
-colA, colB = st.columns(2)
-with colA:
-    logo_u2 = st.file_uploader("Logo (PNG/JPG) for PDF export", type=["png","jpg","jpeg"], key="logo_u2")
-with colB:
-    font_u2 = st.file_uploader("Unicode font (TTF/OTF) for PDF export", type=["ttf","otf"], key="font_u2")
+flows_dict = {
+    "Dry-air mass flow": f"{m_dot_dry:.4f} kg_da/s",
+    "Moist-air mass flow at coil inlet": f"{m_dot_moist_in:.4f} kg/s",
+    "Coil inlet volume": f"{Vdot_m3s:.4f} m3/s",
+    "Coil outlet volume": f"{Vdot_out:.4f} m3/s",
+}
+capacity_dict = {"Q from enthalpy":f"{q_kW:.3f} kW", "Process note":note}
+if Q_total_cooling>0:
+    capacity_dict.update({"Sensible cooling":f"{Q_sens:.3f} kW", "Latent cooling":f"{Q_lat:.3f} kW", "SHR":f"{Q_sens/Q_total_cooling:.3f}"})
+cond_dict = None if not condensate else {
+    "Delta W":f"{condensate['dW_g_per_kg']:.3f} g/kg_da", "Condensate":f"{condensate['mdot_kg_h']:.3f} kg/h", "Volume":f"{condensate['vol_L_h']:.3f} L/h"
+}
 
-if logo_u2 is not None:
-    try:
-        logo_bytes = BytesIO(logo_u2.read())
-    except Exception:
-        logo_bytes = None
-
-if font_u2 is not None:
-    try:
-        tmp_font = tempfile.NamedTemporaryFile(delete=False, suffix=".ttf")
-        tmp_font.write(font_u2.read()); tmp_font.flush()
-        font_path = tmp_font.name
-    except Exception:
-        font_path = None
-
-pdf_bytes = build_pdf({
-    "title": st.session_state.get("report_title", "Moist Air Report") if "report_title" in st.session_state else "Moist Air Report",
-    "logo_bytes": logo_bytes,
-    "notes_text": st.session_state.get("notes_text", "") if "notes_text" in st.session_state else "",
-    "sections": st.session_state.get("sections", ["Inputs","Inlet state","Outlet state","Flows & rates","Condensate","Notes"]),
-    "inputs": inputs_dict,
-    "inlet": inlet_dict,
-    "outlet": outlet_dict,
-    "flows": flows_dict,
-    "capacity": capacity_dict,
-    "condensate": cond_dict,
+st.markdown("## PDF report")
+c1,c2=st.columns(2)
+with c1: logo_u2=st.file_uploader("Logo", type=["png","jpg","jpeg"], key="logo_u2")
+with c2: font_u2=st.file_uploader("Unicode font (optional)", type=["ttf","otf"], key="font_u2")
+logo_bytes=BytesIO(logo_u2.read()) if logo_u2 else None
+font_path=None
+if font_u2:
+    tf=tempfile.NamedTemporaryFile(delete=False,suffix=".ttf"); tf.write(font_u2.read()); tf.flush(); font_path=tf.name
+pdf_bytes=build_pdf({
+    "title":report_title, "logo_bytes":logo_bytes, "notes_text":notes_text, "sections":sections,
+    "inputs":inputs_dict, "return_air":state_dict(return_air) if return_air else {},
+    "fresh_air":state_dict(fresh_air) if fresh_air else {}, "mixed_air":state_dict(s1) if mixed else {},
+    "inlet":state_dict(s1), "outlet":state_dict(s2), "flows":flows_dict,
+    "capacity":capacity_dict, "condensate":cond_dict,
 }, font_path=font_path)
+if isinstance(pdf_bytes,str): pdf_bytes=pdf_bytes.encode('latin-1','ignore')
+st.download_button("📄 Download PDF report", data=bytes(pdf_bytes), file_name="moist_air_mixed_stream_report.pdf", mime="application/pdf", use_container_width=True)
 
-# -------------------- NEW: bulletproof coercion to bytes for Streamlit --------------------
-def _coerce_to_bytes(x):
-    if x is None:
-        return b""
-    if isinstance(x, bytes):
-        return x
-    if isinstance(x, bytearray):
-        return bytes(x)
-    if isinstance(x, memoryview):
-        return x.tobytes()
-    if isinstance(x, str):
-        return x.encode("latin-1", "ignore")
-    if hasattr(x, "getvalue"):  # BytesIO-like
-        return x.getvalue()
-    if hasattr(x, "read"):      # file-like
-        return x.read()
-    raise TypeError(f"Unsupported type for download: {type(x)}")
+with st.expander("Mixing balance check"):
+    if mixed:
+        st.write({
+            "Return dry-air flow kg/s": mixed['details'][0]['m_dot_dry'],
+            "Fresh dry-air flow kg/s": mixed['details'][1]['m_dot_dry'],
+            "Total dry-air flow kg/s": mixed['m_dot_dry'],
+            "Mixed humidity ratio kg/kg_da": s1['W'],
+            "Mixed enthalpy kJ/kg_da": s1['h']/1000,
+        })
 
-pdf_bytes = _coerce_to_bytes(pdf_bytes)
-
-with st.expander("PDF debug", expanded=False):
-    st.write({"type(pdf_bytes)": str(type(pdf_bytes)), "len(pdf_bytes)": len(pdf_bytes)})
-
-st.download_button("📄 Download PDF report", data=pdf_bytes,
-                   file_name="moist_air_report.pdf", mime="application/pdf",
-                   use_container_width=True)
-
-st.caption(
-    "Pinned to Python 3.11 to ensure binary wheels install. "
-    "No SciPy required. Upload a Unicode TTF for full symbol support in the PDF; "
-    "otherwise the app auto-sanitizes to ASCII-safe text."
-)
+st.caption("Mixed-air calculations use dry-air mass, water-vapour mass and enthalpy conservation. Each entered volumetric flow is converted using that stream's own density.")
