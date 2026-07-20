@@ -3,7 +3,7 @@
 # - Pin Python 3.11 (via runtime.txt) so CoolProp/Numpy wheels are available
 # - Recommend fpdf2>=2.7.8 for fewer encoding edge cases
 
-import sys, platform, tempfile
+import sys, platform, tempfile, hmac
 from io import BytesIO
 import streamlit as st
 import numpy as np
@@ -11,6 +11,43 @@ from CoolProp.CoolProp import HAPropsSI
 from fpdf import FPDF
 
 st.set_page_config(page_title="Moist Air Calculator (HVAC volumetric + PDF)", layout="wide")
+
+# -------------------- password protection --------------------
+def require_password():
+    """Stop the app until the password in Streamlit Secrets is entered correctly."""
+    try:
+        expected_password = str(st.secrets["APP_PASSWORD"])
+    except Exception:
+        st.error(
+            "App password is not configured. Add APP_PASSWORD to Streamlit Secrets, "
+            "then reboot the app."
+        )
+        st.code('APP_PASSWORD = "your-password-here"', language="toml")
+        st.stop()
+
+    if not expected_password:
+        st.error("APP_PASSWORD exists but is empty. Enter a non-empty value in Streamlit Secrets.")
+        st.stop()
+
+    if st.session_state.get("password_authenticated", False):
+        return
+
+    st.title("Moist Air Calculator")
+    st.subheader("Protected application")
+    entered_password = st.text_input("Password", type="password", key="password_entry")
+
+    if st.button("Log in", type="primary", use_container_width=True):
+        if hmac.compare_digest(str(entered_password), expected_password):
+            st.session_state["password_authenticated"] = True
+            st.session_state.pop("password_entry", None)
+            st.rerun()
+        else:
+            st.error("Incorrect password. Please try again.")
+
+    st.stop()
+
+require_password()
+
 ATM_P = 101325.0
 
 # -------------------- tiny, robust bisection solver (no SciPy) --------------------
